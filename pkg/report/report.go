@@ -308,13 +308,15 @@ func buildDescription(f Finding, meta typeMeta) string {
 }
 
 func buildRequestPairs(f Finding) [][]string {
+	// Always return an empty array (never null in JSON)
 	if f.RawProbe == "" {
-		return nil
+		return [][]string{}
 	}
 	pair := []string{f.RawProbe}
 	if f.RawResponse != "" {
 		pair = append(pair, f.RawResponse)
 	} else if f.Evidence != "" {
+		// Use evidence as a stand-in for the response when no raw bytes are available
 		pair = append(pair, f.Evidence)
 	}
 	return [][]string{pair}

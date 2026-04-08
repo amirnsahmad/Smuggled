@@ -75,6 +75,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg Config, rep *report.Repor
 		}
 
 		if elapsed > time.Duration(float64(cfg.Timeout)*timeoutRatio) {
+			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ntransfer-encoding: %s\r\n\r\nx=y", path, host, tech.value)
 			rep.Emit(report.Finding{
 				Target:      target.String(),
 				Severity:    report.SeverityProbable,
@@ -82,11 +83,13 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg Config, rep *report.Repor
 				Technique:   tech.name,
 				Description: "H2→H1 downgrade with injected TE header caused timeout — possible H2.TE desync",
 				Evidence:    fmt.Sprintf("elapsed=%v injected_value=%q", elapsed, tech.value),
+				RawProbe:    probe,
 			})
 			continue
 		}
 
 		if isSuspiciousResponse(resp) {
+			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ntransfer-encoding: %s\r\n\r\nx=y", path, host, tech.value)
 			rep.Emit(report.Finding{
 				Target:      target.String(),
 				Severity:    report.SeverityProbable,
@@ -94,6 +97,8 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg Config, rep *report.Repor
 				Technique:   tech.name,
 				Description: fmt.Sprintf("H2→H1 downgrade with injected TE header returned status %d — possible desync", statusCode(resp)),
 				Evidence:    fmt.Sprintf("status=%d elapsed=%v", statusCode(resp), elapsed),
+				RawProbe:    probe,
+				RawResponse: truncate(string(resp), 256),
 			})
 		}
 	}
@@ -197,6 +202,8 @@ done:
 func h2CLDesync(target *url.URL, path, host string, cfg Config, rep *report.Reporter) {
 	// Send H2 request with CL=99 but only 3 bytes of body.
 	// If back-end uses CL (from the downgraded H1 request), it waits for 96 more bytes.
+	probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ncontent-type: application/x-www-form-urlencoded\r\ncontent-length: 99\r\n\r\nx=y", path, host)
+
 	resp, elapsed, err := h2RequestWithInjectedHeader(target, path, host,
 		"content-length", "99", cfg)
 	if err != nil {
@@ -211,6 +218,8 @@ func h2CLDesync(target *url.URL, path, host string, cfg Config, rep *report.Repo
 			Technique:   "H2.CL-mismatch",
 			Description: "H2 request with inflated Content-Length caused timeout — possible H2.CL desync",
 			Evidence:    fmt.Sprintf("elapsed=%v", elapsed),
+			RawProbe:    probe,
+			RawResponse: truncate(string(resp), 256),
 		})
 	}
 }
