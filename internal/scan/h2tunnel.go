@@ -19,6 +19,7 @@ package scan
 //    Detection: same mixedResponse check.
 
 import (
+	"github.com/smuggled/smuggled/internal/config"
 	"bytes"
 	"crypto/tls"
 	"fmt"
@@ -30,7 +31,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 const h2trigger = "FOO BAR AAH\r\n\r\n"
@@ -39,7 +40,7 @@ const h2triggerShort = "FOO\r\n\r\n"
 var h2TunnelMethods = []string{"GET", "POST", "HEAD", "OPTIONS"}
 
 // ScanH2Tunnel probes for H2 tunnel desync (body passes through to back-end).
-func ScanH2Tunnel(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanH2Tunnel(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	if target.Scheme != "https" {
 		return
 	}
@@ -84,7 +85,7 @@ func ScanH2Tunnel(target *url.URL, base []byte, cfg Config, rep *report.Reporter
 }
 
 // ScanHeadScanTE probes for H2.TE tunnel via Transfer-Encoding injection in H2 (HeadScanTE.java).
-func ScanHeadScanTE(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanHeadScanTE(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	if target.Scheme != "https" {
 		return
 	}
@@ -157,7 +158,7 @@ func ScanHeadScanTE(target *url.URL, base []byte, cfg Config, rep *report.Report
 
 // h2RawRequest sends a raw HTTP/2 request using our own HPACK-encoded HEADERS frame.
 // body is appended as a DATA frame; extraHeaders are injected after pseudo-headers.
-func h2RawRequest(target *url.URL, method, path, host, body string, extraHeaders map[string]string, cfg Config) ([]byte, error) {
+func h2RawRequest(target *url.URL, method, path, host, body string, extraHeaders map[string]string, cfg config.Config) ([]byte, error) {
 	addr := target.Hostname() + ":443"
 	if p := target.Port(); p != "" {
 		addr = target.Hostname() + ":" + p
@@ -255,7 +256,7 @@ func mixedH2Response(resp []byte) bool {
 }
 
 // supportsH2 checks ALPN negotiation via TLS handshake.
-func supportsH2(target *url.URL, cfg Config) bool {
+func supportsH2(target *url.URL, cfg config.Config) bool {
 	addr := target.Hostname() + ":443"
 	if p := target.Port(); p != "" {
 		addr = target.Hostname() + ":" + p

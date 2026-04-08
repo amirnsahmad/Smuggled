@@ -20,17 +20,19 @@ package scan
 //   TWO.ZERO   — two-byte size with zero-prefix on second chunk
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 // altTerminators are the non-standard line endings to try.
 var altTerminators = []string{"\n", "\r", "\rX", "\r\r"}
 
 // ScanChunkSizes runs all 8 chunk-size parsing discrepancy probes.
-func ScanChunkSizes(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanChunkSizes(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	host := target.Hostname()
 	if p := target.Port(); p != "" {
 		host = host + ":" + p
@@ -40,7 +42,7 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg Config, rep *report.Report
 		path = "/"
 	}
 
-	method := effectiveMethod(cfg, true)
+	method := config.EffectiveMethod(cfg, true)
 
 	builders := []struct {
 		name  string
@@ -62,7 +64,7 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg Config, rep *report.Report
 			payload := b.build(method, path, host, term)
 			rep.Log("ChunkSize %s term=%q target=%s", b.name, term, host)
 
-			_, _, timedOut, err := rawRequest(target, payload, cfg)
+			_, _, timedOut, err := request.RawRequest(target, payload, cfg)
 			if err != nil {
 				continue
 			}
@@ -73,7 +75,7 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg Config, rep *report.Report
 			// Confirm
 			confirmed := 0
 			for i := 0; i < cfg.ConfirmReps+2; i++ {
-				_, _, to, e := rawRequest(target, payload, cfg)
+				_, _, to, e := request.RawRequest(target, payload, cfg)
 				if e == nil && to {
 					confirmed++
 				}
@@ -92,7 +94,7 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg Config, rep *report.Report
 					"%s: repeated timeout with alternate terminator %s in chunk body. "+
 						"Front-end and back-end disagree on chunk boundary — exploitable for HRS.",
 					b.name, displayTerm),
-				RawProbe: truncate(string(payload), 512),
+				RawProbe: request.Truncate(string(payload), 512),
 			})
 			rep.Log("ChunkSize [!] %s/%s confirmed on %s", b.name, displayTerm, target.String())
 		}

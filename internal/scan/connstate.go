@@ -12,17 +12,19 @@ package scan
 // Some servers flush buffers mid-stream and can be confused by the timing gap.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/smuggled/smuggled/pkg/report"
-	"github.com/smuggled/smuggled/pkg/transport"
+	"github.com/smuggled/smuggled/internal/report"
+	"github.com/smuggled/smuggled/internal/transport"
 )
 
 // ScanConnectionState tests for connection-state-based desync.
-func ScanConnectionState(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("ConnectionState probe: %s", target.Host)
 
 	host := target.Hostname()
@@ -70,7 +72,7 @@ func ScanConnectionState(target *url.URL, base []byte, cfg Config, rep *report.R
 	if t1 || len(r1) == 0 {
 		return
 	}
-	if containsStr(r1, "connection: close") {
+	if request.ContainsStr(r1, "connection: close") {
 		rep.Log("ConnectionState: server closed after warmup")
 		return
 	}
@@ -88,23 +90,23 @@ func ScanConnectionState(target *url.URL, base []byte, cfg Config, rep *report.R
 			Type:        "connection-state",
 			Technique:   "warmup-CLTE",
 			Description: "Second request on keep-alive connection timed out — possible connection-state desync",
-			Evidence:    fmt.Sprintf("elapsed=%v warmup_status=%d", elapsed, statusCode(r1)),
-			RawProbe:    truncate(warmup+"\n---attack---\n"+attack.String(), 768),
+			Evidence:    fmt.Sprintf("elapsed=%v warmup_status=%d", elapsed, request.StatusCode(r1)),
+			RawProbe:    request.Truncate(warmup+"\n---attack---\n"+attack.String(), 768),
 		})
-	} else if len(r2) > 0 && isSuspiciousResponse(r2) {
+	} else if len(r2) > 0 && request.IsSuspiciousResponse(r2) {
 		rep.Emit(report.Finding{
 			Target:      target.String(),
 			Severity:    report.SeverityProbable,
 			Type:        "connection-state",
 			Technique:   "warmup-CLTE-status",
-			Description: fmt.Sprintf("Suspicious status %d on second request suggests connection-state desync", statusCode(r2)),
-			Evidence:    fmt.Sprintf("elapsed=%v r2_status=%d", elapsed, statusCode(r2)),
+			Description: fmt.Sprintf("Suspicious status %d on second request suggests connection-state desync", request.StatusCode(r2)),
+			Evidence:    fmt.Sprintf("elapsed=%v r2_status=%d", elapsed, request.StatusCode(r2)),
 		})
 	}
 }
 
 // ScanPauseDesync tests for pause-based desync (mid-request TCP pause).
-func ScanPauseDesync(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("PauseDesync probe: %s", target.Host)
 
 	host := target.Hostname()
@@ -157,9 +159,9 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg Config, rep *report.Repor
 			Severity:    report.SeverityProbable,
 			Type:        "pause-desync",
 			Technique:   "header-pause",
-			Description: fmt.Sprintf("Server responded (status=%d) after %.1fs pause before body was sent — possible pause desync", statusCode(earlyResp), earlyElapsed.Seconds()),
-			Evidence:    fmt.Sprintf("early_status=%d elapsed=%v", statusCode(earlyResp), earlyElapsed),
-			RawProbe:    truncate(headers+body, 512),
+			Description: fmt.Sprintf("Server responded (status=%d) after %.1fs pause before body was sent — possible pause desync", request.StatusCode(earlyResp), earlyElapsed.Seconds()),
+			Evidence:    fmt.Sprintf("early_status=%d elapsed=%v", request.StatusCode(earlyResp), earlyElapsed),
+			RawProbe:    request.Truncate(headers+body, 512),
 		})
 		return
 	}

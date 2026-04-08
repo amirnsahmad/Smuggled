@@ -15,12 +15,14 @@ package scan
 // (back-end is waiting for the nested request to be processed).
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/smuggled/smuggled/pkg/permute"
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/permute"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 var h1TunnelMethods = []string{"HEAD", "POST", "GET", "OPTIONS"}
@@ -35,7 +37,7 @@ var methodOverrideHeaders = []string{
 }
 
 // ScanH1Tunnel probes for HTTP/1.1 request tunnelling via method confusion.
-func ScanH1Tunnel(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanH1Tunnel(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	host := target.Hostname()
 	if p := target.Port(); p != "" {
 		host = host + ":" + p
@@ -62,7 +64,7 @@ func ScanH1Tunnel(target *url.URL, base []byte, cfg Config, rep *report.Reporter
 			rep.Log("H1Tunnel probe: method=%s tech=%s target=%s", method, tech, host)
 
 			// Timed probe: pause mid-send after headers to detect back-end waiting
-			resp, elapsed, to, err := rawRequest(target, attack, cfg)
+			resp, elapsed, to, err := request.RawRequest(target, attack, cfg)
 			if err != nil {
 				continue
 			}
@@ -80,14 +82,14 @@ func ScanH1Tunnel(target *url.URL, base []byte, cfg Config, rep *report.Reporter
 							"tunnelled request embedded in the body.",
 						method, tech),
 					Evidence:  fmt.Sprintf("elapsed=%v nested_http=true", elapsed),
-					RawProbe:  truncate(string(attack), 512),
+					RawProbe:  request.Truncate(string(attack), 512),
 				})
 				return
 			}
 
 			// TE.CL variant
 			attackTE := buildH1TunnelAttack(mutated, trigger, false)
-			respTE, elapsedTE, toTE, errTE := rawRequest(target, attackTE, cfg)
+			respTE, elapsedTE, toTE, errTE := request.RawRequest(target, attackTE, cfg)
 			if errTE != nil {
 				continue
 			}
@@ -102,7 +104,7 @@ func ScanH1Tunnel(target *url.URL, base []byte, cfg Config, rep *report.Reporter
 							"(method=%s, technique=%s).",
 						method, tech),
 					Evidence:  fmt.Sprintf("elapsed=%v", elapsedTE),
-					RawProbe:  truncate(string(attackTE), 512),
+					RawProbe:  request.Truncate(string(attackTE), 512),
 				})
 				return
 			}
@@ -134,13 +136,13 @@ func buildH1TunnelAttack(base []byte, trigger string, clte bool) []byte {
 	if clte {
 		// CL.TE: 0-terminated chunk + raw trigger as smuggled suffix
 		body := "0\r\n\r\n" + trigger
-		return setContentLength(setBody(base, body), len(trigger))
+		return request.SetContentLength(request.SetBody(base, body), len(trigger))
 	}
 	// TE.CL: chunk promises more than we send; CL points before the data
 	chunkBody := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(trigger), trigger)
 	cl := len(fmt.Sprintf("%x\r\n", len(trigger)))
-	req := setBody(base, chunkBody)
-	req = setContentLength(req, cl)
+	req := request.SetBody(base, chunkBody)
+	req = request.SetContentLength(req, cl)
 	return req
 }
 

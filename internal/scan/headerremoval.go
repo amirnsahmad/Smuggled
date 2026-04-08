@@ -20,17 +20,19 @@ package scan
 //      final out-of-order check.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 const headerRemovalCanary = "wrtzwrrrrr"
 
 // ScanHeaderRemoval probes for proxy header-stripping via Keep-Alive abuse.
-func ScanHeaderRemoval(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	host := target.Hostname()
 	if p := target.Port(); p != "" {
 		host = host + ":" + p
@@ -46,32 +48,32 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg Config, rep *report.Rep
 	attack := buildHeaderRemovalReq(path, host, body, true)
 	harmless := buildHeaderRemovalReq(path, host, body, false)
 
-	harmlessResp, _, _, harmlessErr := rawRequest(target, harmless, cfg)
+	harmlessResp, _, _, harmlessErr := request.RawRequest(target, harmless, cfg)
 	if harmlessErr != nil {
 		return
 	}
 
-	attackResp, _, _, attackErr := rawRequest(target, attack, cfg)
+	attackResp, _, _, attackErr := request.RawRequest(target, attack, cfg)
 	if attackErr != nil {
 		return
 	}
 
 	// If responses are identical, not interesting
-	if statusCode(attackResp) == statusCode(harmlessResp) &&
-		containsStr(attackResp, headerRemovalCanary) == containsStr(harmlessResp, headerRemovalCanary) {
+	if request.StatusCode(attackResp) == request.StatusCode(harmlessResp) &&
+		request.ContainsStr(attackResp, headerRemovalCanary) == request.ContainsStr(harmlessResp, headerRemovalCanary) {
 		return
 	}
 
 	// Confirm stability across 5 attempts
 	diffCount := 0
 	for i := 0; i < 5; i++ {
-		hr, _, _, e1 := rawRequest(target, harmless, cfg)
-		ar, _, _, e2 := rawRequest(target, attack, cfg)
+		hr, _, _, e1 := request.RawRequest(target, harmless, cfg)
+		ar, _, _, e2 := request.RawRequest(target, attack, cfg)
 		if e1 != nil || e2 != nil {
 			continue
 		}
-		if statusCode(ar) != statusCode(hr) ||
-			containsStr(ar, headerRemovalCanary) != containsStr(hr, headerRemovalCanary) {
+		if request.StatusCode(ar) != request.StatusCode(hr) ||
+			request.ContainsStr(ar, headerRemovalCanary) != request.ContainsStr(hr, headerRemovalCanary) {
 			diffCount++
 		}
 	}
@@ -80,9 +82,9 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg Config, rep *report.Rep
 	}
 
 	// Final out-of-order check to filter round-robin noise
-	finalAtk, _, _, _ := rawRequest(target, attack, cfg)
-	if statusCode(finalAtk) == statusCode(harmlessResp) &&
-		containsStr(finalAtk, headerRemovalCanary) == containsStr(harmlessResp, headerRemovalCanary) {
+	finalAtk, _, _, _ := request.RawRequest(target, attack, cfg)
+	if request.StatusCode(finalAtk) == request.StatusCode(harmlessResp) &&
+		request.ContainsStr(finalAtk, headerRemovalCanary) == request.ContainsStr(harmlessResp, headerRemovalCanary) {
 		return
 	}
 
@@ -96,13 +98,13 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg Config, rep *report.Rep
 				"response (status %d vs %d, canary-in-attack=%v vs canary-in-harmless=%v). "+
 				"The proxy may be stripping headers listed in Keep-Alive, enabling "+
 				"Host header injection.",
-			statusCode(attackResp), statusCode(harmlessResp),
-			containsStr(attackResp, headerRemovalCanary),
-			containsStr(harmlessResp, headerRemovalCanary)),
+			request.StatusCode(attackResp), request.StatusCode(harmlessResp),
+			request.ContainsStr(attackResp, headerRemovalCanary),
+			request.ContainsStr(harmlessResp, headerRemovalCanary)),
 		Evidence: fmt.Sprintf(
 			"attack_status=%d harmless_status=%d canary=%s",
-			statusCode(attackResp), statusCode(harmlessResp), headerRemovalCanary),
-		RawProbe: truncate(string(attack), 512),
+			request.StatusCode(attackResp), request.StatusCode(harmlessResp), headerRemovalCanary),
+		RawProbe: request.Truncate(string(attack), 512),
 	})
 	rep.Log("HeaderRemoval [!] confirmed on %s", target.String())
 }

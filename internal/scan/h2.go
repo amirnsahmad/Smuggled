@@ -17,6 +17,8 @@ package scan
 // and test the most reliable downgrade vectors.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"bytes"
 	"crypto/tls"
 	"fmt"
@@ -27,11 +29,11 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 // ScanH2Downgrade probes for HTTP/2 → HTTP/1.1 downgrade desync vectors.
-func ScanH2Downgrade(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	if target.Scheme != "https" {
 		rep.Log("H2Downgrade: skipping non-HTTPS target %s", target.Host)
 		return
@@ -74,7 +76,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg Config, rep *report.Repor
 			continue
 		}
 
-		if elapsed > time.Duration(float64(cfg.Timeout)*timeoutRatio) {
+		if elapsed > time.Duration(float64(cfg.Timeout)*request.TimeoutRatio) {
 			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ntransfer-encoding: %s\r\n\r\nx=y", path, host, tech.value)
 			rep.Emit(report.Finding{
 				Target:      target.String(),
@@ -88,17 +90,17 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg Config, rep *report.Repor
 			continue
 		}
 
-		if isSuspiciousResponse(resp) {
+		if request.IsSuspiciousResponse(resp) {
 			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ntransfer-encoding: %s\r\n\r\nx=y", path, host, tech.value)
 			rep.Emit(report.Finding{
 				Target:      target.String(),
 				Severity:    report.SeverityProbable,
 				Type:        "H2.TE",
 				Technique:   tech.name,
-				Description: fmt.Sprintf("H2→H1 downgrade with injected TE header returned status %d — possible desync", statusCode(resp)),
-				Evidence:    fmt.Sprintf("status=%d elapsed=%v", statusCode(resp), elapsed),
+				Description: fmt.Sprintf("H2→H1 downgrade with injected TE header returned status %d — possible desync", request.StatusCode(resp)),
+				Evidence:    fmt.Sprintf("status=%d elapsed=%v", request.StatusCode(resp), elapsed),
 				RawProbe:    probe,
-				RawResponse: truncate(string(resp), 256),
+				RawResponse: request.Truncate(string(resp), 256),
 			})
 		}
 	}
@@ -109,7 +111,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg Config, rep *report.Repor
 
 // h2RequestWithInjectedHeader sends a raw HTTP/2 request with a header whose
 // value contains injected CRLF or newline sequences to test for H2→H1 downgrade.
-func h2RequestWithInjectedHeader(target *url.URL, path, host, headerName, headerValue string, cfg Config) ([]byte, time.Duration, error) {
+func h2RequestWithInjectedHeader(target *url.URL, path, host, headerName, headerValue string, cfg config.Config) ([]byte, time.Duration, error) {
 	addr := target.Hostname() + ":443"
 	if p := target.Port(); p != "" {
 		addr = target.Hostname() + ":" + p
@@ -199,7 +201,7 @@ done:
 }
 
 // h2CLDesync tests for H2.CL desync where CL in an H2 request conflicts with actual body.
-func h2CLDesync(target *url.URL, path, host string, cfg Config, rep *report.Reporter) {
+func h2CLDesync(target *url.URL, path, host string, cfg config.Config, rep *report.Reporter) {
 	// Send H2 request with CL=99 but only 3 bytes of body.
 	// If back-end uses CL (from the downgraded H1 request), it waits for 96 more bytes.
 	probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ncontent-type: application/x-www-form-urlencoded\r\ncontent-length: 99\r\n\r\nx=y", path, host)
@@ -210,7 +212,7 @@ func h2CLDesync(target *url.URL, path, host string, cfg Config, rep *report.Repo
 		return
 	}
 
-	if elapsed > time.Duration(float64(cfg.Timeout)*timeoutRatio) || len(resp) == 0 {
+	if elapsed > time.Duration(float64(cfg.Timeout)*request.TimeoutRatio) || len(resp) == 0 {
 		rep.Emit(report.Finding{
 			Target:      target.String(),
 			Severity:    report.SeverityProbable,
@@ -219,7 +221,7 @@ func h2CLDesync(target *url.URL, path, host string, cfg Config, rep *report.Repo
 			Description: "H2 request with inflated Content-Length caused timeout — possible H2.CL desync",
 			Evidence:    fmt.Sprintf("elapsed=%v", elapsed),
 			RawProbe:    probe,
-			RawResponse: truncate(string(resp), 256),
+			RawResponse: request.Truncate(string(resp), 256),
 		})
 	}
 }

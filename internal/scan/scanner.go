@@ -7,21 +7,23 @@ package scan
 // and writes findings to the Reporter.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"net/url"
 	"strings"
 
-	"github.com/smuggled/smuggled/pkg/permute"
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/permute"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 // Scanner orchestrates all detection modules against a single target.
 type Scanner struct {
-	cfg Config
+	cfg config.Config
 	rep *report.Reporter
 }
 
 // New creates a Scanner.
-func New(cfg Config, rep *report.Reporter) *Scanner {
+func New(cfg config.Config, rep *report.Reporter) *Scanner {
 	return &Scanner{cfg: cfg, rep: rep}
 }
 
@@ -36,28 +38,28 @@ func (s *Scanner) Scan(rawURL string) {
 		u.Scheme = "https"
 	}
 
-	if !connectivityCheck(u, s.cfg) {
+	if !request.ConnectivityCheck(u, s.cfg) {
 		s.rep.Log("host %s appears unresponsive, skipping", u.Host)
 		return
 	}
 
-	methods := effectiveMethods(s.cfg)
+	methods := config.EffectiveMethods(s.cfg)
 	s.rep.Progress("scanning %s [methods=%s]", u.String(), strings.Join(methods, ","))
 
 	for _, method := range methods {
 		// Clone config scoped to this single method so modules always see
-		// a single-element Methods list and effectiveMethods(cfg)[0] is unambiguous.
+		// a single-element Methods list and config.EffectiveMethods(cfg)[0] is unambiguous.
 		methodCfg := s.cfg
 		methodCfg.Methods = []string{method}
 
-		base := buildRequestForMethod(u, method)
+		base := request.BuildRequestForMethod(u, method)
 		s.rep.Log("--- method=%s ---", method)
 		s.runModules(u, base, methodCfg)
 	}
 }
 
 // runModules fires every enabled detection module in a defined order.
-func (s *Scanner) runModules(u *url.URL, base []byte, cfg Config) {
+func (s *Scanner) runModules(u *url.URL, base []byte, cfg config.Config) {
 	rep := s.rep
 
 	// ── H/1.1 body-desync ────────────────────────────────────────────────────
@@ -138,7 +140,7 @@ func filterTechniques(all []permute.Technique, filter []string) []permute.Techni
 
 // techniqueEnabled reports whether a named technique should run given the filter.
 // Equivalent to filterTechniques for single-name checks.
-func techniqueEnabled(name string, cfg Config) bool {
+func techniqueEnabled(name string, cfg config.Config) bool {
 	if len(cfg.TechniquesFilter) == 0 {
 		return true
 	}

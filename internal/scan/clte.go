@@ -13,16 +13,18 @@ package scan
 // Confirmation: repeat cfg.ConfirmReps times, require consistent signal.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 
-	"github.com/smuggled/smuggled/pkg/permute"
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/permute"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 // ScanCLTE iterates all H1 TE permutations looking for a CL.TE desync signal.
-func ScanCLTE(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
-	workingBase, probeMethod := upgradeToBodyMethod(base, cfg, rep.Log)
+func ScanCLTE(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
+	workingBase, probeMethod := request.UpgradeToBodyMethod(base, cfg, rep.Log)
 
 	for _, tech := range filterTechniques(permute.H1Techniques(), cfg.TechniquesFilter) {
 		if tech.H2Only {
@@ -33,23 +35,23 @@ func ScanCLTE(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 		if mutated == nil {
 			continue
 		}
-		mutated = addTE(mutated)
-		mutated = setConnection(mutated, "close")
+		mutated = request.AddTE(mutated)
+		mutated = request.SetConnection(mutated, "close")
 
 		const smuggledPrefix = "G"
 		chunkBody := fmt.Sprintf("0\r\n\r\n%s", smuggledPrefix)
-		probeReq := setContentLength(setBody(mutated, chunkBody), len(chunkBody))
+		probeReq := request.SetContentLength(request.SetBody(mutated, chunkBody), len(chunkBody))
 
 		rep.Log("CL.TE probe: technique=%s method=%s target=%s", tech.Name, probeMethod, target.Host)
 
-		resp, _, timedOut, err := rawRequest(target, probeReq, cfg)
+		resp, _, timedOut, err := request.RawRequest(target, probeReq, cfg)
 		if err != nil {
 			rep.Log("CL.TE send error (%s): %v", tech.Name, err)
 			continue
 		}
 
-		if timedOut || isSuspiciousResponse(resp) {
-			confirmed := confirmProbe(target, probeReq, cfg, rep.Log, "CL.TE")
+		if timedOut || request.IsSuspiciousResponse(resp) {
+			confirmed := request.ConfirmProbe(target, probeReq, cfg, rep.Log, "CL.TE")
 			sev := report.SeverityProbable
 			if confirmed {
 				sev = report.SeverityConfirmed
@@ -60,9 +62,9 @@ func ScanCLTE(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 				Type:        "CL.TE",
 				Technique:   tech.Name,
 				Description: fmt.Sprintf("Front-end uses Content-Length; back-end uses Transfer-Encoding (method: %s)", probeMethod),
-				Evidence:    fmt.Sprintf("timeout=%v status=%d confirmed=%v", timedOut, statusCode(resp), confirmed),
-				RawProbe:    truncate(string(probeReq), 512),
-				RawResponse: truncate(string(resp), 512),
+				Evidence:    fmt.Sprintf("timeout=%v status=%d confirmed=%v", timedOut, request.StatusCode(resp), confirmed),
+				RawProbe:    request.Truncate(string(probeReq), 512),
+				RawResponse: request.Truncate(string(resp), 512),
 			})
 			return // one finding per target per method is sufficient
 		}

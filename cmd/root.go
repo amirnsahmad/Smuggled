@@ -10,9 +10,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/smuggled/smuggled/pkg/permute"
-	"github.com/smuggled/smuggled/pkg/report"
-	"github.com/smuggled/smuggled/pkg/scan"
+	"github.com/smuggled/smuggled/internal/permute"
+	"github.com/smuggled/smuggled/internal/report"
+	"github.com/smuggled/smuggled/internal/config"
+	"github.com/smuggled/smuggled/internal/scan"
 )
 
 var (
@@ -169,7 +170,7 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	rep := report.New(out, flagJSON, flagVerbose)
 
-	cfg := scan.Config{
+	cfg := config.Config{
 		Timeout:             time.Duration(flagTimeout) * time.Second,
 		Proxy:               flagProxy,
 		SkipTLSVerify:       flagSkipTLS,

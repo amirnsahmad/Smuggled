@@ -12,12 +12,14 @@ package scan
 // Conversely, if the back-end ignores a header the front-end parses: also interesting.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"bytes"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 type hideTechnique string
@@ -38,7 +40,7 @@ type canaryHeader struct {
 }
 
 // ScanParserDiscrepancy probes for header parsing discrepancies between front and back-end.
-func ScanParserDiscrepancy(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("ParserDiscrepancy probe: %s", target.Host)
 
 	// Strip to a clean base: only keep essential headers
@@ -53,12 +55,12 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg Config, rep *report
 	hideTechs := []hideTechnique{hideSpace, hideTab, hideWrap, hideHop, hideLpad}
 
 	// Baseline: clean request with no canary
-	baseResp, _, baseTimedOut, err := rawRequest(target, clean, cfg)
+	baseResp, _, baseTimedOut, err := request.RawRequest(target, clean, cfg)
 	if err != nil || baseTimedOut {
 		rep.Log("ParserDiscrepancy: baseline failed, skipping")
 		return
 	}
-	baseStatus := statusCode(baseResp)
+	baseStatus := request.StatusCode(baseResp)
 
 	for _, canary := range canaries {
 		for _, hide := range hideTechs {
@@ -67,12 +69,12 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg Config, rep *report
 				continue
 			}
 
-			resp, _, timedOut, err := rawRequest(target, probeReq, cfg)
+			resp, _, timedOut, err := request.RawRequest(target, probeReq, cfg)
 			if err != nil || timedOut {
 				continue
 			}
 
-			probeStatus := statusCode(resp)
+			probeStatus := request.StatusCode(resp)
 			interesting := false
 			desc := ""
 
@@ -97,11 +99,11 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg Config, rep *report
 				// Confirm consistency
 				confirmedCount := 0
 				for i := 0; i < cfg.ConfirmReps; i++ {
-					r2, _, t2, e2 := rawRequest(target, probeReq, cfg)
+					r2, _, t2, e2 := request.RawRequest(target, probeReq, cfg)
 					if e2 != nil || t2 {
 						continue
 					}
-					if statusCode(r2) == probeStatus {
+					if request.StatusCode(r2) == probeStatus {
 						confirmedCount++
 					}
 				}
@@ -116,8 +118,8 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg Config, rep *report
 					Type:        "parser-discrepancy",
 					Technique:   string(hide) + "/" + canary.name,
 					Description: desc,
-					RawProbe:    truncate(string(probeReq), 512),
-					RawResponse: truncate(string(resp), 256),
+					RawProbe:    request.Truncate(string(probeReq), 512),
+					RawResponse: request.Truncate(string(resp), 256),
 				})
 			}
 		}

@@ -11,17 +11,19 @@ package scan
 // We also test for servers that accept a body on GET when chunked encoding is present.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"bytes"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/smuggled/smuggled/pkg/report"
-	"github.com/smuggled/smuggled/pkg/transport"
+	"github.com/smuggled/smuggled/internal/report"
+	"github.com/smuggled/smuggled/internal/transport"
 )
 
 // ScanImplicitZero probes for implicit zero-CL GET desync.
-func ScanImplicitZero(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanImplicitZero(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("ImplicitZero probe: %s", target.Host)
 
 	host := target.Hostname()
@@ -71,7 +73,7 @@ func ScanImplicitZero(target *url.URL, base []byte, cfg Config, rep *report.Repo
 	}
 
 	// Check connection still alive
-	if containsStr(r1, "connection: close") {
+	if request.ContainsStr(r1, "connection: close") {
 		return
 	}
 
@@ -82,7 +84,7 @@ func ScanImplicitZero(target *url.URL, base []byte, cfg Config, rep *report.Repo
 	r2, _, t2 := conn.RecvWithTimeout(cfg.Timeout)
 
 	if !t2 && len(r2) > 0 {
-		st2 := statusCode(r2)
+		st2 := request.StatusCode(r2)
 		if st2 == 400 || st2 == 405 || bytes.Contains(r2, []byte(smuggledMethod)) {
 			rep.Emit(report.Finding{
 				Target:      target.String(),
@@ -90,8 +92,8 @@ func ScanImplicitZero(target *url.URL, base []byte, cfg Config, rep *report.Repo
 				Type:        "implicit-zero-CL",
 				Technique:   "GET-chunked-smuggle",
 				Description: fmt.Sprintf("Follow-up request got status %d with smuggled method in response — implicit CL=0 GET desync", st2),
-				Evidence:    fmt.Sprintf("r1_status=%d r2_status=%d", statusCode(r1), st2),
-				RawProbe:    truncate(getChunked.String(), 512),
+				Evidence:    fmt.Sprintf("r1_status=%d r2_status=%d", request.StatusCode(r1), st2),
+				RawProbe:    request.Truncate(getChunked.String(), 512),
 			})
 			return
 		}
@@ -101,7 +103,7 @@ func ScanImplicitZero(target *url.URL, base []byte, cfg Config, rep *report.Repo
 	scanHeadDesync(target, host, path, cfg, rep)
 }
 
-func scanHeadDesync(target *url.URL, host, path string, cfg Config, rep *report.Reporter) {
+func scanHeadDesync(target *url.URL, host, path string, cfg config.Config, rep *report.Reporter) {
 	smuggledPrefix := "GPOST " + path + " HTTP/1.1\r\nFoo: x"
 	bodyLen := len(smuggledPrefix)
 
@@ -128,7 +130,7 @@ func scanHeadDesync(target *url.URL, host, path string, cfg Config, rep *report.
 	if t1 || len(r1) == 0 {
 		return
 	}
-	if containsStr(r1, "connection: close") {
+	if request.ContainsStr(r1, "connection: close") {
 		return
 	}
 
@@ -142,8 +144,8 @@ func scanHeadDesync(target *url.URL, host, path string, cfg Config, rep *report.
 			Type:        "implicit-zero-CL",
 			Technique:   "HEAD-body-smuggle",
 			Description: "HEAD request with body smuggled prefix — follow-up reflected smuggled method",
-			Evidence:    fmt.Sprintf("r2_status=%d", statusCode(r2)),
-			RawProbe:    truncate(headReq.String(), 512),
+			Evidence:    fmt.Sprintf("r2_status=%d", request.StatusCode(r2)),
+			RawProbe:    request.Truncate(headReq.String(), 512),
 		})
 	}
 }

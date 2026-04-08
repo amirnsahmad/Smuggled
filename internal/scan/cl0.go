@@ -23,12 +23,14 @@ package scan
 // CL-e, CL-dec, CL-commaprefix, CL-commasuffix, CL-error, CL-spacepad.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/smuggled/smuggled/pkg/permute"
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/permute"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 // clGadgets are candidate paths whose distinctive responses can be used
@@ -65,7 +67,7 @@ var clMutations = []struct {
 }
 
 // ScanCL0 runs CL.0 desync detection with all CL mutation techniques.
-func ScanCL0(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	host := target.Hostname()
 	if p := target.Port(); p != "" {
 		host = host + ":" + p
@@ -76,8 +78,8 @@ func ScanCL0(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 	}
 
 	// Build a clean keep-alive POST base for CL.0 probing
-	method := effectiveMethod(cfg, true)
-	basePost := buildKeepAliveRequest(method, path, host)
+	method := config.EffectiveMethod(cfg, true)
+	basePost := request.BuildKeepAliveRequest(method, path, host)
 
 	// Detect which gadget is viable for this target
 	gadget := selectCL0Gadget(target, basePost, cfg, rep)
@@ -97,20 +99,20 @@ func ScanCL0(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 
 		// Build attack: body = smuggled prefix, CL mutated to look like 0
 		clVal := fmt.Sprintf("%d", len(smuggledPrefix))
-		req := setBody(basePost, smuggledPrefix)
-		req = setContentLength(req, len(smuggledPrefix))
+		req := request.SetBody(basePost, smuggledPrefix)
+		req = request.SetContentLength(req, len(smuggledPrefix))
 		req = mut.mutate(req, clVal)
 
 		baseStatus := 0
-		baseResp, _, _, _ := rawRequest(target, basePost, cfg)
+		baseResp, _, _, _ := request.RawRequest(target, basePost, cfg)
 		if baseResp != nil {
-			baseStatus = statusCode(baseResp)
+			baseStatus = request.StatusCode(baseResp)
 		}
 
 		// Send the attack up to 9 times; look for gadget bleed after attempt 1
 		var lastResp []byte
 		for i := 0; i < 9; i++ {
-			resp, _, timedOut, err := rawRequest(target, req, cfg)
+			resp, _, timedOut, err := request.RawRequest(target, req, cfg)
 			if err != nil || timedOut {
 				break
 			}
@@ -129,22 +131,22 @@ func ScanCL0(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 								"Reference: https://portswigger.net/research/browser-powered-desync-attacks",
 							i, mut.name, gadget.lookFor),
 						Evidence:  fmt.Sprintf("attempt=%d smuggled_prefix=%q", i, smuggledPrefix),
-						RawProbe:  truncate(string(req), 512),
+						RawProbe:  request.Truncate(string(req), 512),
 					})
 					rep.Log("CL.0 [!] confirmed: %s/%s on %s", mut.name, gadget.payload, target.String())
 					return
 				}
 
 				// Potential CL.0: mutation caused 400 on a normally-2xx endpoint
-				if baseStatus > 0 && baseStatus < 400 && statusCode(resp) == 400 {
+				if baseStatus > 0 && baseStatus < 400 && request.StatusCode(resp) == 400 {
 					// Verify with a space-only body (should NOT trigger 400)
-					fakeReq := setBody(basePost, " ")
-					fakeReq = setContentLength(fakeReq, 1)
+					fakeReq := request.SetBody(basePost, " ")
+					fakeReq = request.SetContentLength(fakeReq, 1)
 					fakeReq = mut.mutate(fakeReq, "1")
 					allGood := true
 					for k := 0; k < 5; k++ {
-						fr, _, _, ferr := rawRequest(target, fakeReq, cfg)
-						if ferr != nil || statusCode(fr) == 400 {
+						fr, _, _, ferr := request.RawRequest(target, fakeReq, cfg)
+						if ferr != nil || request.StatusCode(fr) == 400 {
 							allGood = false
 							break
 						}
@@ -174,7 +176,7 @@ func ScanCL0(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 
 // selectCL0Gadget fires each gadget request directly to find one whose
 // response is distinctive and not already present in baseline responses.
-func selectCL0Gadget(target *url.URL, baseReq []byte, cfg Config, rep *report.Reporter) *struct {
+func selectCL0Gadget(target *url.URL, baseReq []byte, cfg config.Config, rep *report.Reporter) *struct {
 	payload    string
 	lookFor    string
 	headerOnly bool
@@ -184,7 +186,7 @@ func selectCL0Gadget(target *url.URL, baseReq []byte, cfg Config, rep *report.Re
 		host = host + ":" + p
 	}
 
-	baseResp, _, _, _ := rawRequest(target, baseReq, cfg)
+	baseResp, _, _, _ := request.RawRequest(target, baseReq, cfg)
 
 	for i := range clGadgets {
 		g := &clGadgets[i]
@@ -197,13 +199,13 @@ func selectCL0Gadget(target *url.URL, baseReq []byte, cfg Config, rep *report.Re
 			continue
 		}
 		// Build a clean GET to the gadget path
-		gadgetReq := buildGETRequest(g.payload, host)
-		resp, _, timedOut, err := rawRequest(target, gadgetReq, cfg)
+		gadgetReq := request.BuildGETRequest(g.payload, host)
+		resp, _, timedOut, err := request.RawRequest(target, gadgetReq, cfg)
 		if err != nil || timedOut || len(resp) == 0 {
 			continue
 		}
 		// Skip if baseline already contains the gadget marker
-		if baseResp != nil && containsStr(baseResp, g.lookFor) {
+		if baseResp != nil && request.ContainsStr(baseResp, g.lookFor) {
 			continue
 		}
 		if !gadgetMatches(resp, g) {
@@ -230,7 +232,7 @@ func gadgetMatches(resp []byte, g *struct {
 				break
 			}
 		}
-		return containsStr(resp[:end], g.lookFor)
+		return request.ContainsStr(resp[:end], g.lookFor)
 	}
-	return containsStr(resp, g.lookFor)
+	return request.ContainsStr(resp, g.lookFor)
 }

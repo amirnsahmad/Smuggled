@@ -15,16 +15,18 @@ package scan
 // normalising the duplicate CL header (mirrors bypassContentLengthFix in Java).
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 
-	"github.com/smuggled/smuggled/pkg/permute"
-	"github.com/smuggled/smuggled/pkg/report"
+	"github.com/smuggled/smuggled/internal/permute"
+	"github.com/smuggled/smuggled/internal/report"
 )
 
 // ScanTECL iterates all H1 TE permutations looking for a TE.CL desync signal.
-func ScanTECL(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
-	workingBase, probeMethod := upgradeToBodyMethod(base, cfg, rep.Log)
+func ScanTECL(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
+	workingBase, probeMethod := request.UpgradeToBodyMethod(base, cfg, rep.Log)
 
 	smuggledPrefix := fmt.Sprintf("GPOST / HTTP/1.1\r\nHost: %s\r\n\r\n", target.Hostname())
 	chunkSize := len(smuggledPrefix)
@@ -41,21 +43,21 @@ func ScanTECL(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 		if mutated == nil {
 			continue
 		}
-		mutated = addTE(mutated)
-		mutated = setConnection(mutated, "close")
+		mutated = request.AddTE(mutated)
+		mutated = request.SetConnection(mutated, "close")
 
-		probeReq := bypassCLFix(setContentLength(setBody(mutated, body), cl))
+		probeReq := request.BypassCLFix(request.SetContentLength(request.SetBody(mutated, body), cl))
 
 		rep.Log("TE.CL probe: technique=%s method=%s target=%s", tech.Name, probeMethod, target.Host)
 
-		resp, _, timedOut, err := rawRequest(target, probeReq, cfg)
+		resp, _, timedOut, err := request.RawRequest(target, probeReq, cfg)
 		if err != nil {
 			rep.Log("TE.CL send error (%s): %v", tech.Name, err)
 			continue
 		}
 
 		if timedOut {
-			confirmed := confirmProbe(target, probeReq, cfg, rep.Log, "TE.CL")
+			confirmed := request.ConfirmProbe(target, probeReq, cfg, rep.Log, "TE.CL")
 			sev := report.SeverityProbable
 			if confirmed {
 				sev = report.SeverityConfirmed
@@ -67,8 +69,8 @@ func ScanTECL(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 				Technique:   tech.Name,
 				Description: fmt.Sprintf("Front-end uses Transfer-Encoding; back-end uses Content-Length (method: %s)", probeMethod),
 				Evidence:    fmt.Sprintf("timeout=true confirmed=%v", confirmed),
-				RawProbe:    truncate(string(probeReq), 512),
-				RawResponse: truncate(string(resp), 512),
+				RawProbe:    request.Truncate(string(probeReq), 512),
+				RawResponse: request.Truncate(string(resp), 512),
 			})
 			return
 		}

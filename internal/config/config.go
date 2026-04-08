@@ -1,4 +1,4 @@
-package scan
+package config
 
 // config.go — scan configuration and method resolution.
 
@@ -59,7 +59,7 @@ func DefaultConfig() Config {
 
 // effectiveMethods returns the deduplicated, uppercased method list.
 // Always returns at least ["POST"].
-func effectiveMethods(cfg Config) []string {
+func EffectiveMethods(cfg Config) []string {
 	if len(cfg.Methods) == 0 {
 		return []string{"POST"}
 	}
@@ -82,9 +82,9 @@ func effectiveMethods(cfg Config) []string {
 // requiresBody=true: if the configured method is bodyless (GET/HEAD/OPTIONS/TRACE)
 // and ForceMethod is not set, returns "POST" instead and the caller should log
 // the upgrade.
-func effectiveMethod(cfg Config, requiresBody bool) string {
-	m := effectiveMethods(cfg)[0]
-	if requiresBody && !cfg.ForceMethod && isBodylessMethod(m) {
+func EffectiveMethod(cfg Config, requiresBody bool) string {
+	m := EffectiveMethods(cfg)[0]
+	if requiresBody && !cfg.ForceMethod && IsBodylessMethod(m) {
 		return "POST"
 	}
 	return m
@@ -92,7 +92,7 @@ func effectiveMethod(cfg Config, requiresBody bool) string {
 
 // isBodylessMethod returns true for HTTP methods that do not carry a request body
 // in normal usage.
-func isBodylessMethod(m string) bool {
+func IsBodylessMethod(m string) bool {
 	switch strings.ToUpper(m) {
 	case "GET", "HEAD", "OPTIONS", "TRACE":
 		return true

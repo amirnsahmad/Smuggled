@@ -11,17 +11,19 @@ package scan
 // gets a response, the server treated the two messages as one — classic client desync.
 
 import (
+	"github.com/smuggled/smuggled/internal/request"
+	"github.com/smuggled/smuggled/internal/config"
 	"fmt"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/smuggled/smuggled/pkg/report"
-	"github.com/smuggled/smuggled/pkg/transport"
+	"github.com/smuggled/smuggled/internal/report"
+	"github.com/smuggled/smuggled/internal/transport"
 )
 
 // ScanClientDesync probes for browser-powered / client-side desync.
-func ScanClientDesync(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
+func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("ClientDesync probe: %s", target.Host)
 
 	host := target.Hostname()
@@ -73,13 +75,13 @@ func ScanClientDesync(target *url.URL, base []byte, cfg Config, rep *report.Repo
 		return
 	}
 
-	st1 := statusCode(r1)
+	st1 := request.StatusCode(r1)
 	if st1 == 0 {
 		return
 	}
 
 	// Check if connection is still alive (server sent keep-alive)
-	if containsStr(r1, "connection: close") {
+	if request.ContainsStr(r1, "connection: close") {
 		rep.Log("ClientDesync: server closed connection, not vulnerable")
 		return
 	}
@@ -104,7 +106,7 @@ func ScanClientDesync(target *url.URL, base []byte, cfg Config, rep *report.Repo
 		return
 	}
 
-	st2 := statusCode(r2)
+	st2 := request.StatusCode(r2)
 
 	// Two valid responses on a single connection where the second came back fast
 	// is the key indicator of client-side desync.
@@ -120,7 +122,7 @@ func ScanClientDesync(target *url.URL, base []byte, cfg Config, rep *report.Repo
 			Technique:   "CL-body-smuggle",
 			Description: desc,
 			Evidence:    fmt.Sprintf("r1_status=%d r2_status=%d elapsed=%v", st1, st2, elapsed1),
-			RawProbe:    truncate(string(probeBytes)+"\n---followup---\n"+string(followupBytes), 768),
+			RawProbe:    request.Truncate(string(probeBytes)+"\n---followup---\n"+string(followupBytes), 768),
 		})
 	}
 }
