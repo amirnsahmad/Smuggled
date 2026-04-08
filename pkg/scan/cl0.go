@@ -77,7 +77,7 @@ func ScanCL0(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 
 	// Build a clean keep-alive POST base for CL.0 probing
 	method := effectiveMethod(cfg, true)
-	basePost := buildCL0Base(method, path, host)
+	basePost := buildKeepAliveRequest(method, path, host)
 
 	// Detect which gadget is viable for this target
 	gadget := selectCL0Gadget(target, basePost, cfg, rep)
@@ -90,7 +90,7 @@ func ScanCL0(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 	smuggledPrefix := fmt.Sprintf("%s\r\nX-%s: ", gadget.payload, canary)
 
 	for _, mut := range clMutations {
-		if !techniqueEnabled("CL0-"+mut.name, cfg) {
+		if !techniqueEnabled(mut.name, cfg) {
 			continue
 		}
 		rep.Log("CL.0 probe: technique=%s gadget=%s target=%s", mut.name, gadget.payload, host)
@@ -197,7 +197,7 @@ func selectCL0Gadget(target *url.URL, baseReq []byte, cfg Config, rep *report.Re
 			continue
 		}
 		// Build a clean GET to the gadget path
-		gadgetReq := buildSimpleGET(g.payload, host)
+		gadgetReq := buildGETRequest(g.payload, host)
 		resp, _, timedOut, err := rawRequest(target, gadgetReq, cfg)
 		if err != nil || timedOut || len(resp) == 0 {
 			continue
@@ -233,44 +233,4 @@ func gadgetMatches(resp []byte, g *struct {
 		return containsStr(resp[:end], g.lookFor)
 	}
 	return containsStr(resp, g.lookFor)
-}
-
-func buildCL0Base(method, path, host string) []byte {
-	var b strings.Builder
-	b.WriteString(method + " " + path + " HTTP/1.1\r\n")
-	b.WriteString("Host: " + host + "\r\n")
-	b.WriteString("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36\r\n")
-	b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
-	b.WriteString("Content-Length: 0\r\n")
-	b.WriteString("Connection: keep-alive\r\n")
-	b.WriteString("\r\n")
-	return []byte(b.String())
-}
-
-func buildSimpleGET(requestLine, host string) []byte {
-	// requestLine is like "GET /robots.txt HTTP/1.1"
-	// we need to convert it to a full request
-	parts := strings.SplitN(requestLine, " ", 3)
-	if len(parts) < 2 {
-		return nil
-	}
-	path := parts[1]
-	var b strings.Builder
-	b.WriteString("GET " + path + " HTTP/1.1\r\n")
-	b.WriteString("Host: " + host + "\r\n")
-	b.WriteString("Connection: close\r\n")
-	b.WriteString("\r\n")
-	return []byte(b.String())
-}
-
-func techniqueEnabled(name string, cfg Config) bool {
-	if len(cfg.TechniquesFilter) == 0 {
-		return true
-	}
-	for _, t := range cfg.TechniquesFilter {
-		if strings.EqualFold(t, name) {
-			return true
-		}
-	}
-	return false
 }

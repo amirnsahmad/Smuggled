@@ -183,7 +183,7 @@ func runScan(_ *cobra.Command, args []string) error {
 		SkipClientDesync:    flagSkipClientDesync,
 		SkipPause:           flagSkipPause,
 		SkipImplicitZero:    flagSkipImplicit,
-		SkipConnectionState: flagSkipConnState,
+		SkipConnState: flagSkipConnState,
 		SkipCL0:             flagSkipCL0,
 		SkipChunkSizes:      flagSkipChunkSizes,
 		SkipH1Tunnel:        flagSkipH1Tunnel,
