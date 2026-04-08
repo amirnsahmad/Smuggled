@@ -62,7 +62,7 @@ func ScanTECL(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 		// Bypass content-length normalisation: lowercase to avoid lib interference
 		probeReq = bypassCLFix(probeReq)
 
-		_, _, timedOut, err := rawRequest(target, probeReq, cfg)
+		probeResp, _, timedOut, err := rawRequest(target, probeReq, cfg)
 		if err != nil {
 			rep.Log("TE.CL send error (%s): %v", tech.Name, err)
 			continue
@@ -82,6 +82,7 @@ func ScanTECL(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 				Description: "Front-end uses Transfer-Encoding; back-end uses Content-Length",
 				Evidence:    fmt.Sprintf("timeout=true confirmed=%v", confirmed),
 				RawProbe:    truncate(string(probeReq), 512),
+				RawResponse: truncate(string(probeResp), 512),
 			})
 			return
 		}

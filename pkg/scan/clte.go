@@ -76,6 +76,7 @@ func ScanCLTE(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 				Description: fmt.Sprintf("Front-end uses Content-Length; back-end uses Transfer-Encoding (probe method: %s)", probeMethod),
 				Evidence:    fmt.Sprintf("timeout=%v status=%d confirmed=%v", timedOut, statusCode(resp), confirmed),
 				RawProbe:    truncate(string(probeReq), 512),
+				RawResponse: truncate(string(resp), 512),
 			})
 			return
 		}

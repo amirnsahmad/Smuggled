@@ -117,6 +117,7 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg Config, rep *report
 					Technique:   string(hide) + "/" + canary.name,
 					Description: desc,
 					RawProbe:    truncate(string(probeReq), 512),
+					RawResponse: truncate(string(resp), 256),
 				})
 			}
 		}
