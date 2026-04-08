@@ -13,7 +13,6 @@ import (
 	"bytes"
 	"fmt"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/smuggled/smuggled/pkg/permute"
@@ -26,8 +25,8 @@ func ScanCLTE(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 	// (GET/HEAD/OPTIONS) without --force-method, silently use POST for this probe.
 	probeMethod := effectiveMethod(cfg, true)
 	workingBase := base
-	if probeMethod != strings.ToUpper(cfg.Method) && cfg.Method != "" {
-		rep.Log("CL.TE: upgrading method %s→POST (body required; use --force-method to override)", cfg.Method)
+	if probeMethod != effectiveMethods(cfg)[0] && len(cfg.Methods) > 0 {
+		rep.Log("CL.TE: upgrading method %s→POST (body required; use --force-method to override)", effectiveMethods(cfg)[0])
 		workingBase = permute.SetMethod(base, probeMethod)
 		// Restore Content-Type and CL that may be missing on a GET base
 		workingBase = permute.SetHeader(workingBase, "Content-Type", "application/x-www-form-urlencoded")

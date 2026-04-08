@@ -21,47 +21,86 @@ type Config struct {
 	SkipTLSVerify bool
 	Verbose       bool
 	Workers       int
-	ConfirmReps   int // number of repeat confirmations (default 3)
+	ConfirmReps   int
 
-	// Method overrides the HTTP method used in the base request.
-	// Accepts any valid HTTP method: GET, POST, PUT, PATCH, OPTIONS, HEAD, etc.
-	// An empty value defaults to POST (required for body-bearing smuggling probes).
-	// Note: GET/HEAD disable body-based probes (CL.TE, TE.CL) automatically —
-	// those modules will fall back to POST internally unless ForceMethod is set.
-	Method      string
-	ForceMethod bool // if true, use Method even for probes that normally need POST
+	// Methods is the list of HTTP methods to use for base requests.
+	// Supports multi-value: []string{"GET","POST","HEAD"}.
+	// Empty defaults to []string{"POST"}.
+	Methods []string
 
-	// Feature flags
+	// ForceMethod: if true, body-bearing probes (CL.TE/TE.CL) use the
+	// configured method even when bodyless (GET/HEAD). Without this flag
+	// those probes silently upgrade to POST.
+	ForceMethod bool
+
+	// Feature flags — each skip disables a detection module
 	SkipH2              bool
 	SkipParser          bool
 	SkipClientDesync    bool
 	SkipPause           bool
 	SkipImplicitZero    bool
 	SkipConnectionState bool
-	TechniquesFilter    []string // if set, only run these technique names
+	SkipCL0             bool
+	SkipChunkSizes      bool
+	SkipH1Tunnel        bool
+	SkipH2Tunnel        bool
+	SkipHeaderRemoval   bool
+
+	TechniquesFilter []string // if non-empty, only run matching technique names
 }
 
-// DefaultConfig returns sensible defaults.
+// DefaultConfig returns production-safe defaults.
 func DefaultConfig() Config {
 	return Config{
 		Timeout:     10 * time.Second,
 		ConfirmReps: 3,
 		Workers:     5,
+		Methods:     []string{"POST"},
 	}
 }
 
-// Target bundles a parsed URL with the raw request bytes to use as base.
-type Target struct {
-	URL     *url.URL
-	BaseReq []byte // raw HTTP/1.1 request bytes
+// effectiveMethods returns the deduplicated, uppercased list of methods to scan.
+// Falls back to ["POST"] when empty.
+func effectiveMethods(cfg Config) []string {
+	if len(cfg.Methods) == 0 {
+		return []string{"POST"}
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range cfg.Methods {
+		u := strings.ToUpper(strings.TrimSpace(m))
+		if u != "" && !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"POST"}
+	}
+	return out
 }
 
-// BuildBaseRequest constructs a minimal HTTP request for the given URL.
-// The method is taken from cfg.Method; defaults to POST when empty.
-// For methods that don't carry a body (GET, HEAD, OPTIONS), Content-Length
-// and the body are omitted — smuggling probes that need a body will override
-// internally via permute.SetMethod or use their own POST variant.
+// effectiveMethod returns the single method to use for a probe.
+// requiresBody=true: bodyless methods are upgraded to POST unless ForceMethod.
+func effectiveMethod(cfg Config, requiresBody bool) string {
+	methods := effectiveMethods(cfg)
+	m := methods[0] // primary method
+	if requiresBody && !cfg.ForceMethod {
+		switch m {
+		case "GET", "HEAD", "OPTIONS", "TRACE":
+			return "POST"
+		}
+	}
+	return m
+}
+
+// BuildBaseRequest builds a raw HTTP/1.1 request for method + URL.
 func BuildBaseRequest(u *url.URL, cfg Config) []byte {
+	return buildRequestForMethod(u, effectiveMethods(cfg)[0])
+}
+
+// buildRequestForMethod builds a raw request for a specific method.
+func buildRequestForMethod(u *url.URL, method string) []byte {
 	host := u.Hostname()
 	if p := u.Port(); p != "" {
 		host = host + ":" + p
@@ -70,12 +109,6 @@ func BuildBaseRequest(u *url.URL, cfg Config) []byte {
 	if path == "" {
 		path = "/"
 	}
-
-	method := strings.ToUpper(cfg.Method)
-	if method == "" {
-		method = "POST"
-	}
-
 	hasBody := method != "GET" && method != "HEAD" && method != "OPTIONS" && method != "TRACE"
 
 	var b strings.Builder
@@ -94,26 +127,8 @@ func BuildBaseRequest(u *url.URL, cfg Config) []byte {
 	return []byte(b.String())
 }
 
-// effectiveMethod returns the method to actually use for a probe.
-// If ForceMethod is true, always honours cfg.Method.
-// Otherwise, probes that require a body (CL.TE / TE.CL) silently upgrade
-// GET/HEAD to POST so the scan still runs.
-func effectiveMethod(cfg Config, requiresBody bool) string {
-	m := strings.ToUpper(cfg.Method)
-	if m == "" {
-		m = "POST"
-	}
-	if requiresBody && !cfg.ForceMethod {
-		switch m {
-		case "GET", "HEAD", "OPTIONS", "TRACE":
-			return "POST" // upgrade silently — user chose a bodyless method but probe needs one
-		}
-	}
-	return m
-}
+// ─── Internal helpers shared across scan modules ──────────────────────────────
 
-// rawRequest opens a fresh connection, sends raw bytes, and returns the response.
-// elapsed is the time until first-byte (or timeout).
 func rawRequest(target *url.URL, payload []byte, cfg Config) (resp []byte, elapsed time.Duration, timedOut bool, err error) {
 	conn, err := transport.Dial(target, cfg.Timeout, cfg.Proxy, cfg.SkipTLSVerify)
 	if err != nil {
@@ -132,23 +147,19 @@ func rawRequest(target *url.URL, payload []byte, cfg Config) (resp []byte, elaps
 	return data, dur, false, nil
 }
 
-// statusCode extracts the HTTP status code integer from raw response bytes.
 func statusCode(resp []byte) int {
 	if len(resp) < 12 {
 		return 0
 	}
-	// "HTTP/1.1 200 ..."
 	code := 0
 	fmt.Sscanf(string(resp[9:12]), "%d", &code)
 	return code
 }
 
-// containsStr checks whether the response contains a substring (case-insensitive).
 func containsStr(resp []byte, s string) bool {
 	return bytes.Contains(bytes.ToLower(resp), []byte(strings.ToLower(s)))
 }
 
-// makeChunkedBody encodes body as chunked with given hex size + terminates with 0\r\n\r\n.
 func makeChunkedBody(body string, extraLen int) string {
 	sz := len(body) + extraLen
 	if sz <= 0 {
@@ -157,27 +168,26 @@ func makeChunkedBody(body string, extraLen int) string {
 	return fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", sz, body)
 }
 
-// setBody replaces everything after \r\n\r\n in the request.
 func setBody(req []byte, body string) []byte {
 	sep := []byte("\r\n\r\n")
 	idx := bytes.Index(req, sep)
 	if idx < 0 {
 		return append(req, []byte(body)...)
 	}
-	return append(req[:idx+4], []byte(body)...)
+	result := make([]byte, idx+4+len(body))
+	copy(result, req[:idx+4])
+	copy(result[idx+4:], []byte(body))
+	return result
 }
 
-// setContentLength replaces the Content-Length header value.
 func setContentLength(req []byte, n int) []byte {
 	return permute.SetHeader(req, "Content-Length", fmt.Sprintf("%d", n))
 }
 
-// setConnection sets the Connection header.
 func setConnection(req []byte, value string) []byte {
 	return permute.SetHeader(req, "Connection", value)
 }
 
-// addTE adds Transfer-Encoding: chunked if not present.
 func addTE(req []byte) []byte {
 	if !bytes.Contains(bytes.ToLower(req), []byte("transfer-encoding:")) {
 		return permute.SetHeader(req, "Transfer-Encoding", "chunked")
@@ -185,7 +195,6 @@ func addTE(req []byte) []byte {
 	return req
 }
 
-// connectivityCheck sends a normal GET to verify the host is reachable.
 func connectivityCheck(u *url.URL, cfg Config) bool {
 	host := u.Hostname()
 	if p := u.Port(); p != "" {
@@ -197,31 +206,29 @@ func connectivityCheck(u *url.URL, cfg Config) bool {
 	}
 	req := []byte("GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")
 	resp, _, timedOut, err := rawRequest(u, req, cfg)
-	if err != nil || timedOut || len(resp) == 0 {
-		return false
-	}
-	return true
+	return err == nil && !timedOut && len(resp) > 0
 }
 
-// filterTechniques returns a subset of techniques if a filter is configured.
 func filterTechniques(all []permute.Technique, filter []string) []permute.Technique {
 	if len(filter) == 0 {
 		return all
 	}
 	set := make(map[string]bool, len(filter))
 	for _, f := range filter {
-		set[f] = true
+		set[strings.ToLower(f)] = true
 	}
 	var out []permute.Technique
 	for _, t := range all {
-		if set[t.Name] {
+		if set[strings.ToLower(t.Name)] {
 			out = append(out, t)
 		}
 	}
 	return out
 }
 
-// Scanner orchestrates all scan modules against a single target.
+// ─── Scanner ──────────────────────────────────────────────────────────────────
+
+// Scanner orchestrates all detection modules against a single target.
 type Scanner struct {
 	cfg      Config
 	reporter *report.Reporter
@@ -232,7 +239,7 @@ func New(cfg Config, r *report.Reporter) *Scanner {
 	return &Scanner{cfg: cfg, reporter: r}
 }
 
-// Scan runs all enabled scan modules against a target URL.
+// Scan runs all enabled modules against the target URL for every configured method.
 func (s *Scanner) Scan(rawURL string) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -243,39 +250,81 @@ func (s *Scanner) Scan(rawURL string) {
 		u.Scheme = "https"
 	}
 
-	method := strings.ToUpper(s.cfg.Method)
-	if method == "" {
-		method = "POST"
-	}
-	s.reporter.Progress("scanning %s [method=%s]", u.String(), method)
-
-	base := BuildBaseRequest(u, s.cfg)
-
 	if !connectivityCheck(u, s.cfg) {
 		s.reporter.Log("host %s appears unresponsive, skipping", u.Host)
 		return
 	}
 
-	// Run all modules
-	ScanCLTE(u, base, s.cfg, s.reporter)
-	ScanTECL(u, base, s.cfg, s.reporter)
+	methods := effectiveMethods(s.cfg)
+	s.reporter.Progress("scanning %s [methods=%s]", u.String(), strings.Join(methods, ","))
 
-	if !s.cfg.SkipParser {
-		ScanParserDiscrepancy(u, base, s.cfg, s.reporter)
+	for _, method := range methods {
+		// Build a config scoped to this single method
+		methodCfg := s.cfg
+		methodCfg.Methods = []string{method}
+
+		base := buildRequestForMethod(u, method)
+
+		s.reporter.Log("--- method=%s ---", method)
+		s.runModules(u, base, methodCfg)
 	}
-	if !s.cfg.SkipClientDesync {
-		ScanClientDesync(u, base, s.cfg, s.reporter)
+}
+
+// runModules fires every enabled scanner module for a given (url, base, cfg) triple.
+func (s *Scanner) runModules(u *url.URL, base []byte, cfg Config) {
+	rep := s.reporter
+
+	// ── Core HTTP/1.1 desync ─────────────────────────────────────────────────
+	ScanCLTE(u, base, cfg, rep)
+	ScanTECL(u, base, cfg, rep)
+
+	// ── CL.0 ────────────────────────────────────────────────────────────────
+	if !cfg.SkipCL0 {
+		ScanCL0(u, base, cfg, rep)
 	}
-	if !s.cfg.SkipConnectionState {
-		ScanConnectionState(u, base, s.cfg, s.reporter)
+
+	// ── Chunk-size parsing discrepancies ─────────────────────────────────────
+	if !cfg.SkipChunkSizes {
+		ScanChunkSizes(u, base, cfg, rep)
 	}
-	if !s.cfg.SkipImplicitZero {
-		ScanImplicitZero(u, base, s.cfg, s.reporter)
+
+	// ── Parser discrepancy (v3.0) ────────────────────────────────────────────
+	if !cfg.SkipParser {
+		ScanParserDiscrepancy(u, base, cfg, rep)
 	}
-	if !s.cfg.SkipPause {
-		ScanPauseDesync(u, base, s.cfg, s.reporter)
+
+	// ── Client-side desync ───────────────────────────────────────────────────
+	if !cfg.SkipClientDesync {
+		ScanClientDesync(u, base, cfg, rep)
 	}
-	if !s.cfg.SkipH2 {
-		ScanH2Downgrade(u, base, s.cfg, s.reporter)
+
+	// ── Connection-state + pause desync ─────────────────────────────────────
+	if !cfg.SkipConnectionState {
+		ScanConnectionState(u, base, cfg, rep)
+	}
+	if !cfg.SkipPause {
+		ScanPauseDesync(u, base, cfg, rep)
+	}
+
+	// ── Implicit zero CL ─────────────────────────────────────────────────────
+	if !cfg.SkipImplicitZero {
+		ScanImplicitZero(u, base, cfg, rep)
+	}
+
+	// ── H1 tunnel (HEAD/method-override) ────────────────────────────────────
+	if !cfg.SkipH1Tunnel {
+		ScanH1Tunnel(u, base, cfg, rep)
+	}
+
+	// ── H2 downgrade, H2 tunnel, HeadScanTE ─────────────────────────────────
+	if !cfg.SkipH2 {
+		ScanH2Downgrade(u, base, cfg, rep)
+		ScanH2Tunnel(u, base, cfg, rep)
+		ScanHeadScanTE(u, base, cfg, rep)
+	}
+
+	// ── Header removal (Keep-Alive stripping) ────────────────────────────────
+	if !cfg.SkipHeaderRemoval {
+		ScanHeaderRemoval(u, base, cfg, rep)
 	}
 }

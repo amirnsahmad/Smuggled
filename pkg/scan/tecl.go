@@ -10,7 +10,6 @@ package scan
 import (
 	"fmt"
 	"net/url"
-	"strings"
 
 	"github.com/smuggled/smuggled/pkg/permute"
 	"github.com/smuggled/smuggled/pkg/report"
@@ -20,8 +19,8 @@ import (
 func ScanTECL(target *url.URL, base []byte, cfg Config, rep *report.Reporter) {
 	probeMethod := effectiveMethod(cfg, true)
 	workingBase := base
-	if probeMethod != strings.ToUpper(cfg.Method) && cfg.Method != "" {
-		rep.Log("TE.CL: upgrading method %s→POST (body required; use --force-method to override)", cfg.Method)
+	if probeMethod != effectiveMethods(cfg)[0] && len(cfg.Methods) > 0 {
+		rep.Log("TE.CL: upgrading method %s→POST (body required; use --force-method to override)", effectiveMethods(cfg)[0])
 		workingBase = permute.SetMethod(base, probeMethod)
 		workingBase = permute.SetHeader(workingBase, "Content-Type", "application/x-www-form-urlencoded")
 		workingBase = permute.SetHeader(workingBase, "Content-Length", "3")

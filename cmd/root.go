@@ -26,7 +26,7 @@ var (
 	flagProxy        string
 	flagSkipTLS      bool
 	flagConfirm      int
-	flagMethod       string
+	flagMethods      []string
 	flagForceMethod  bool
 
 	flagSkipH2           bool
@@ -35,6 +35,11 @@ var (
 	flagSkipPause        bool
 	flagSkipImplicit     bool
 	flagSkipConnState    bool
+	flagSkipCL0          bool
+	flagSkipChunkSizes   bool
+	flagSkipH1Tunnel     bool
+	flagSkipH2Tunnel     bool
+	flagSkipHeaderRemoval bool
 	flagTechniques       []string
 
 	rootCmd = &cobra.Command{
@@ -57,7 +62,8 @@ Examples:
   smuggled scan -u https://example.com --verbose
   smuggled scan -f targets.txt --workers 10 --json
   cat urls.txt | smuggled scan
-  smuggled scan https://a.com https://b.com --skip-h2 --timeout 15`,
+  smuggled scan https://example.com -m POST,GET,HEAD
+  smuggled scan https://example.com -m GET --force-method --skip-h2`,
 		RunE: runScan,
 	}
 
@@ -89,21 +95,30 @@ func init() {
 	scanCmd.Flags().IntVarP(&flagTimeout, "timeout", "t", 10, "Request timeout in seconds")
 	scanCmd.Flags().IntVarP(&flagWorkers, "workers", "w", 5, "Number of concurrent workers")
 	scanCmd.Flags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose output")
-	scanCmd.Flags().BoolVarP(&flagJSON, "json", "j", false, "JSON output (one finding per line, good for pipelines)")
+	scanCmd.Flags().BoolVarP(&flagJSON, "json", "j", false, "JSON output (one finding per line)")
 	scanCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "Write output to file")
 	scanCmd.Flags().StringVarP(&flagProxy, "proxy", "p", "", "HTTP proxy URL (e.g. http://127.0.0.1:8080)")
 	scanCmd.Flags().BoolVar(&flagSkipTLS, "skip-tls-verify", false, "Skip TLS certificate verification")
 	scanCmd.Flags().IntVarP(&flagConfirm, "confirm", "c", 3, "Confirmations required to reduce false positives")
-	scanCmd.Flags().StringVarP(&flagMethod, "method", "m", "", "HTTP method for base request (default: POST). GET/HEAD are upgraded to POST for body-bearing probes unless --force-method is set")
-	scanCmd.Flags().BoolVar(&flagForceMethod, "force-method", false, "Force the chosen method even on probes that normally require POST (may reduce findings)")
+	scanCmd.Flags().StringSliceVarP(&flagMethods, "method", "m", nil,
+		"HTTP method(s) for probes. Comma-separated or repeated flag.\n"+
+			"  Examples: -m POST   -m GET,POST,HEAD   -m GET -m POST\n"+
+			"  Default: POST. GET/HEAD upgrade to POST for body probes unless --force-method.")
+	scanCmd.Flags().BoolVar(&flagForceMethod, "force-method", false,
+		"Force chosen method(s) even on body-bearing probes (CL.TE, TE.CL). May reduce findings.")
 
-	scanCmd.Flags().BoolVar(&flagSkipH2, "skip-h2", false, "Skip HTTP/2 downgrade scans")
+	scanCmd.Flags().BoolVar(&flagSkipH2, "skip-h2", false, "Skip HTTP/2 downgrade, H2 tunnel and HeadScanTE scans")
 	scanCmd.Flags().BoolVar(&flagSkipParser, "skip-parser", false, "Skip parser discrepancy scans")
 	scanCmd.Flags().BoolVar(&flagSkipClientDesync, "skip-client-desync", false, "Skip client-side desync scans")
 	scanCmd.Flags().BoolVar(&flagSkipPause, "skip-pause", false, "Skip pause-based desync scans")
 	scanCmd.Flags().BoolVar(&flagSkipImplicit, "skip-implicit", false, "Skip implicit zero CL scans")
 	scanCmd.Flags().BoolVar(&flagSkipConnState, "skip-conn-state", false, "Skip connection state manipulation scans")
-	scanCmd.Flags().StringSliceVar(&flagTechniques, "techniques", nil, "Comma-separated technique names to run (default: all)")
+	scanCmd.Flags().BoolVar(&flagSkipCL0, "skip-cl0", false, "Skip CL.0 desync scans")
+	scanCmd.Flags().BoolVar(&flagSkipChunkSizes, "skip-chunk-sizes", false, "Skip chunk-size terminator discrepancy scans (TERM.EXT, EXT.TERM, etc.)")
+	scanCmd.Flags().BoolVar(&flagSkipH1Tunnel, "skip-h1-tunnel", false, "Skip H1 tunnel scans (HEAD/method-override)")
+	scanCmd.Flags().BoolVar(&flagSkipH2Tunnel, "skip-h2-tunnel", false, "Skip H2 tunnel and HeadScanTE (overrides --skip-h2 for tunnel only)")
+	scanCmd.Flags().BoolVar(&flagSkipHeaderRemoval, "skip-header-removal", false, "Skip Keep-Alive header removal scan")
+	scanCmd.Flags().StringSliceVar(&flagTechniques, "techniques", nil, "Comma-separated technique names to run (default: all). See 'techniques' subcommand.")
 
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(versionCmd)
@@ -161,7 +176,7 @@ func runScan(_ *cobra.Command, args []string) error {
 		Verbose:             flagVerbose,
 		Workers:             flagWorkers,
 		ConfirmReps:         flagConfirm,
-		Method:              flagMethod,
+		Methods:             flagMethods,
 		ForceMethod:         flagForceMethod,
 		SkipH2:              flagSkipH2,
 		SkipParser:          flagSkipParser,
@@ -169,6 +184,11 @@ func runScan(_ *cobra.Command, args []string) error {
 		SkipPause:           flagSkipPause,
 		SkipImplicitZero:    flagSkipImplicit,
 		SkipConnectionState: flagSkipConnState,
+		SkipCL0:             flagSkipCL0,
+		SkipChunkSizes:      flagSkipChunkSizes,
+		SkipH1Tunnel:        flagSkipH1Tunnel,
+		SkipH2Tunnel:        flagSkipH2Tunnel || flagSkipH2,
+		SkipHeaderRemoval:   flagSkipHeaderRemoval,
 		TechniquesFilter:    flagTechniques,
 	}
 

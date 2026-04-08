@@ -22,14 +22,12 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/smuggled/smuggled/pkg/report"
-	"github.com/smuggled/smuggled/pkg/transport"
 )
 
 // ScanH2Downgrade probes for HTTP/2 → HTTP/1.1 downgrade desync vectors.
@@ -215,33 +213,4 @@ func h2CLDesync(target *url.URL, path, host string, cfg Config, rep *report.Repo
 			Evidence:    fmt.Sprintf("elapsed=%v", elapsed),
 		})
 	}
-}
-
-// supportsH2 checks whether the server negotiates HTTP/2 via ALPN.
-func supportsH2(target *url.URL, cfg Config) bool {
-	addr := target.Hostname() + ":443"
-	if p := target.Port(); p != "" {
-		addr = target.Hostname() + ":" + p
-	}
-	conn, err := transport.Dial(target, cfg.Timeout, cfg.Proxy, cfg.SkipTLSVerify)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-
-	// We need tls.Conn to inspect ALPN — re-dial with tls directly
-	tlsCfg := &tls.Config{
-		ServerName:         target.Hostname(),
-		InsecureSkipVerify: cfg.SkipTLSVerify, //nolint:gosec
-		NextProtos:         []string{"h2", "http/1.1"},
-	}
-	netDialer2 := &net.Dialer{Timeout: cfg.Timeout}
-	tlsConn, err := tls.DialWithDialer(netDialer2, "tcp", addr, tlsCfg)
-	if err != nil {
-		return false
-	}
-	defer tlsConn.Close()
-
-	proto := tlsConn.ConnectionState().NegotiatedProtocol
-	return strings.Contains(proto, "h2")
 }
