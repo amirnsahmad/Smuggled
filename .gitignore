@@ -1,0 +1,18 @@
+# Binaries
+bin/
+smuggled
+
+# Go
+*.test
+*.out
+coverage.html
+
+# Vendor
+vendor/
+
+# OS
+.DS_Store
+*.swp
+
+# Build artifacts
+dist/
