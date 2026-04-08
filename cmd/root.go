@@ -26,14 +26,16 @@ var (
 	flagProxy        string
 	flagSkipTLS      bool
 	flagConfirm      int
+	flagMethod       string
+	flagForceMethod  bool
 
-	flagSkipH2          bool
-	flagSkipParser      bool
+	flagSkipH2           bool
+	flagSkipParser       bool
 	flagSkipClientDesync bool
-	flagSkipPause       bool
-	flagSkipImplicit    bool
-	flagSkipConnState   bool
-	flagTechniques      []string
+	flagSkipPause        bool
+	flagSkipImplicit     bool
+	flagSkipConnState    bool
+	flagTechniques       []string
 
 	rootCmd = &cobra.Command{
 		Use:   "smuggled",
@@ -92,6 +94,8 @@ func init() {
 	scanCmd.Flags().StringVarP(&flagProxy, "proxy", "p", "", "HTTP proxy URL (e.g. http://127.0.0.1:8080)")
 	scanCmd.Flags().BoolVar(&flagSkipTLS, "skip-tls-verify", false, "Skip TLS certificate verification")
 	scanCmd.Flags().IntVarP(&flagConfirm, "confirm", "c", 3, "Confirmations required to reduce false positives")
+	scanCmd.Flags().StringVarP(&flagMethod, "method", "m", "", "HTTP method for base request (default: POST). GET/HEAD are upgraded to POST for body-bearing probes unless --force-method is set")
+	scanCmd.Flags().BoolVar(&flagForceMethod, "force-method", false, "Force the chosen method even on probes that normally require POST (may reduce findings)")
 
 	scanCmd.Flags().BoolVar(&flagSkipH2, "skip-h2", false, "Skip HTTP/2 downgrade scans")
 	scanCmd.Flags().BoolVar(&flagSkipParser, "skip-parser", false, "Skip parser discrepancy scans")
@@ -157,6 +161,8 @@ func runScan(_ *cobra.Command, args []string) error {
 		Verbose:             flagVerbose,
 		Workers:             flagWorkers,
 		ConfirmReps:         flagConfirm,
+		Method:              flagMethod,
+		ForceMethod:         flagForceMethod,
 		SkipH2:              flagSkipH2,
 		SkipParser:          flagSkipParser,
 		SkipClientDesync:    flagSkipClientDesync,

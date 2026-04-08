@@ -16,21 +16,29 @@ import (
 
 // Config holds per-scan configuration passed from the CLI.
 type Config struct {
-	Timeout     time.Duration
-	Proxy       string
+	Timeout       time.Duration
+	Proxy         string
 	SkipTLSVerify bool
-	Verbose     bool
-	Workers     int
-	ConfirmReps int // number of repeat confirmations (default 3)
+	Verbose       bool
+	Workers       int
+	ConfirmReps   int // number of repeat confirmations (default 3)
+
+	// Method overrides the HTTP method used in the base request.
+	// Accepts any valid HTTP method: GET, POST, PUT, PATCH, OPTIONS, HEAD, etc.
+	// An empty value defaults to POST (required for body-bearing smuggling probes).
+	// Note: GET/HEAD disable body-based probes (CL.TE, TE.CL) automatically —
+	// those modules will fall back to POST internally unless ForceMethod is set.
+	Method      string
+	ForceMethod bool // if true, use Method even for probes that normally need POST
 
 	// Feature flags
-	SkipH2           bool
-	SkipParser       bool
-	SkipClientDesync bool
-	SkipPause        bool
-	SkipImplicitZero bool
+	SkipH2              bool
+	SkipParser          bool
+	SkipClientDesync    bool
+	SkipPause           bool
+	SkipImplicitZero    bool
 	SkipConnectionState bool
-	TechniquesFilter []string // if set, only run these technique names
+	TechniquesFilter    []string // if set, only run these technique names
 }
 
 // DefaultConfig returns sensible defaults.
@@ -48,8 +56,12 @@ type Target struct {
 	BaseReq []byte // raw HTTP/1.1 request bytes
 }
 
-// BuildBaseRequest constructs a minimal POST request for the given URL.
-func BuildBaseRequest(u *url.URL) []byte {
+// BuildBaseRequest constructs a minimal HTTP request for the given URL.
+// The method is taken from cfg.Method; defaults to POST when empty.
+// For methods that don't carry a body (GET, HEAD, OPTIONS), Content-Length
+// and the body are omitted — smuggling probes that need a body will override
+// internally via permute.SetMethod or use their own POST variant.
+func BuildBaseRequest(u *url.URL, cfg Config) []byte {
 	host := u.Hostname()
 	if p := u.Port(); p != "" {
 		host = host + ":" + p
@@ -59,16 +71,45 @@ func BuildBaseRequest(u *url.URL) []byte {
 		path = "/"
 	}
 
+	method := strings.ToUpper(cfg.Method)
+	if method == "" {
+		method = "POST"
+	}
+
+	hasBody := method != "GET" && method != "HEAD" && method != "OPTIONS" && method != "TRACE"
+
 	var b strings.Builder
-	b.WriteString("POST " + path + " HTTP/1.1\r\n")
+	b.WriteString(method + " " + path + " HTTP/1.1\r\n")
 	b.WriteString("Host: " + host + "\r\n")
 	b.WriteString("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36\r\n")
-	b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
-	b.WriteString("Content-Length: 3\r\n")
+	if hasBody {
+		b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
+		b.WriteString("Content-Length: 3\r\n")
+	}
 	b.WriteString("Connection: close\r\n")
 	b.WriteString("\r\n")
-	b.WriteString("x=y")
+	if hasBody {
+		b.WriteString("x=y")
+	}
 	return []byte(b.String())
+}
+
+// effectiveMethod returns the method to actually use for a probe.
+// If ForceMethod is true, always honours cfg.Method.
+// Otherwise, probes that require a body (CL.TE / TE.CL) silently upgrade
+// GET/HEAD to POST so the scan still runs.
+func effectiveMethod(cfg Config, requiresBody bool) string {
+	m := strings.ToUpper(cfg.Method)
+	if m == "" {
+		m = "POST"
+	}
+	if requiresBody && !cfg.ForceMethod {
+		switch m {
+		case "GET", "HEAD", "OPTIONS", "TRACE":
+			return "POST" // upgrade silently — user chose a bodyless method but probe needs one
+		}
+	}
+	return m
 }
 
 // rawRequest opens a fresh connection, sends raw bytes, and returns the response.
@@ -202,9 +243,13 @@ func (s *Scanner) Scan(rawURL string) {
 		u.Scheme = "https"
 	}
 
-	s.reporter.Progress("scanning %s", u.String())
+	method := strings.ToUpper(s.cfg.Method)
+	if method == "" {
+		method = "POST"
+	}
+	s.reporter.Progress("scanning %s [method=%s]", u.String(), method)
 
-	base := BuildBaseRequest(u)
+	base := BuildBaseRequest(u, s.cfg)
 
 	if !connectivityCheck(u, s.cfg) {
 		s.reporter.Log("host %s appears unresponsive, skipping", u.Host)
