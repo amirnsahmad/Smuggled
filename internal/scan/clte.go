@@ -25,6 +25,7 @@ import (
 // ScanCLTE iterates all H1 TE permutations looking for a CL.TE desync signal.
 func ScanCLTE(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	workingBase, probeMethod := request.UpgradeToBodyMethod(base, cfg, rep.Log)
+	configuredMethod := config.EffectiveMethods(cfg)[0]
 
 	for _, tech := range filterTechniques(permute.H1Techniques(), cfg.TechniquesFilter) {
 		if tech.H2Only {
@@ -56,13 +57,17 @@ func ScanCLTE(target *url.URL, base []byte, cfg config.Config, rep *report.Repor
 			if confirmed {
 				sev = report.SeverityConfirmed
 			}
+			desc := "Front-end uses Content-Length; back-end uses Transfer-Encoding."
+			if probeMethod != configuredMethod {
+				desc += fmt.Sprintf(" Probe sent as %s (upgraded from %s — CL.TE requires a body).", probeMethod, configuredMethod)
+			}
 			rep.Emit(report.Finding{
 				Target:      target.String(),
 				Method:      probeMethod,
 				Severity:    sev,
 				Type:        "CL.TE",
 				Technique:   tech.Name,
-				Description: fmt.Sprintf("Front-end uses Content-Length; back-end uses Transfer-Encoding (method: %s)", probeMethod),
+				Description: desc,
 				Evidence:    fmt.Sprintf("timeout=%v status=%d confirmed=%v", timedOut, request.StatusCode(resp), confirmed),
 				RawProbe:    request.Truncate(string(probeReq), 512),
 				RawResponse: request.Truncate(string(resp), 512),
