@@ -117,6 +117,7 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 
 		rep.Emit(report.Finding{
 			Target:      target.String(),
+			Method:      config.EffectiveMethods(cfg)[0],
 			Severity:    report.SeverityProbable,
 			Type:        "client-desync",
 			Technique:   "CL-body-smuggle",

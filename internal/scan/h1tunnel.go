@@ -73,6 +73,7 @@ func ScanH1Tunnel(target *url.URL, base []byte, cfg config.Config, rep *report.R
 			if !to && len(resp) > 0 && hasNestedHTTPResponse(resp) {
 				rep.Emit(report.Finding{
 					Target:   target.String(),
+					Method:      config.EffectiveMethods(cfg)[0],
 					Severity: report.SeverityConfirmed,
 					Type:     "H1-tunnel",
 					Technique: fmt.Sprintf("%s/%s", method, tech),
@@ -96,6 +97,7 @@ func ScanH1Tunnel(target *url.URL, base []byte, cfg config.Config, rep *report.R
 			if !toTE && len(respTE) > 0 && hasNestedHTTPResponse(respTE) {
 				rep.Emit(report.Finding{
 					Target:   target.String(),
+					Method:      config.EffectiveMethods(cfg)[0],
 					Severity: report.SeverityConfirmed,
 					Type:     "H1-tunnel",
 					Technique: fmt.Sprintf("%s/%s/TE.CL", method, tech),

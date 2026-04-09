@@ -122,6 +122,7 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 				if gadgetMatches(resp, gadget) {
 					rep.Emit(report.Finding{
 						Target:   target.String(),
+						Method:      config.EffectiveMethods(cfg)[0],
 						Severity: report.SeverityConfirmed,
 						Type:     "CL.0",
 						Technique: mut.name + "|" + gadget.payload,
@@ -154,6 +155,7 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 					if allGood {
 						rep.Emit(report.Finding{
 							Target:    target.String(),
+							Method:      config.EffectiveMethods(cfg)[0],
 							Severity:  report.SeverityProbable,
 							Type:      "CL.0-potential",
 							Technique: mut.name,

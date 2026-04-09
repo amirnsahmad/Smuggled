@@ -68,6 +68,7 @@ func ScanH2Tunnel(target *url.URL, base []byte, cfg config.Config, rep *report.R
 			if mixedH2Response(resp) {
 				rep.Emit(report.Finding{
 					Target:   target.String(),
+					Method:      "HTTP/2",
 					Severity: report.SeverityConfirmed,
 					Type:     "H2-tunnel",
 					Technique: fmt.Sprintf("H2-tunnel/%s", method),
@@ -139,6 +140,7 @@ func ScanHeadScanTE(target *url.URL, base []byte, cfg config.Config, rep *report
 			if mixedH2Response(resp) {
 				rep.Emit(report.Finding{
 					Target:   target.String(),
+					Method:      "HTTP/2",
 					Severity: report.SeverityConfirmed,
 					Type:     "H2.TE-tunnel",
 					Technique: fmt.Sprintf("HeadTE/%s/%s", method, perm.name),

@@ -58,6 +58,7 @@ func ScanCLTE(target *url.URL, base []byte, cfg config.Config, rep *report.Repor
 			}
 			rep.Emit(report.Finding{
 				Target:      target.String(),
+				Method:      probeMethod,
 				Severity:    sev,
 				Type:        "CL.TE",
 				Technique:   tech.Name,

@@ -86,6 +86,7 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 	if t2 {
 		rep.Emit(report.Finding{
 			Target:      target.String(),
+			Method:      config.EffectiveMethods(cfg)[0],
 			Severity:    report.SeverityProbable,
 			Type:        "connection-state",
 			Technique:   "warmup-CLTE",
@@ -96,6 +97,7 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 	} else if len(r2) > 0 && request.IsSuspiciousResponse(r2) {
 		rep.Emit(report.Finding{
 			Target:      target.String(),
+			Method:      config.EffectiveMethods(cfg)[0],
 			Severity:    report.SeverityProbable,
 			Type:        "connection-state",
 			Technique:   "warmup-CLTE-status",
@@ -156,6 +158,7 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 		// Server responded before we sent the body — it forwarded an incomplete request
 		rep.Emit(report.Finding{
 			Target:      target.String(),
+			Method:      config.EffectiveMethods(cfg)[0],
 			Severity:    report.SeverityProbable,
 			Type:        "pause-desync",
 			Technique:   "header-pause",

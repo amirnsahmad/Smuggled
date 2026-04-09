@@ -80,6 +80,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ntransfer-encoding: %s\r\n\r\nx=y", path, host, tech.value)
 			rep.Emit(report.Finding{
 				Target:      target.String(),
+				Method:      "HTTP/2",
 				Severity:    report.SeverityProbable,
 				Type:        "H2.TE",
 				Technique:   tech.name,
@@ -94,6 +95,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ntransfer-encoding: %s\r\n\r\nx=y", path, host, tech.value)
 			rep.Emit(report.Finding{
 				Target:      target.String(),
+				Method:      "HTTP/2",
 				Severity:    report.SeverityProbable,
 				Type:        "H2.TE",
 				Technique:   tech.name,
@@ -215,6 +217,7 @@ func h2CLDesync(target *url.URL, path, host string, cfg config.Config, rep *repo
 	if elapsed > time.Duration(float64(cfg.Timeout)*request.TimeoutRatio) || len(resp) == 0 {
 		rep.Emit(report.Finding{
 			Target:      target.String(),
+			Method:      "HTTP/2",
 			Severity:    report.SeverityProbable,
 			Type:        "H2.CL",
 			Technique:   "H2.CL-mismatch",

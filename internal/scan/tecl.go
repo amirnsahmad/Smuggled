@@ -64,6 +64,7 @@ func ScanTECL(target *url.URL, base []byte, cfg config.Config, rep *report.Repor
 			}
 			rep.Emit(report.Finding{
 				Target:      target.String(),
+				Method:      probeMethod,
 				Severity:    sev,
 				Type:        "TE.CL",
 				Technique:   tech.Name,

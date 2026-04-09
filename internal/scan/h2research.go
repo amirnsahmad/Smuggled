@@ -79,6 +79,7 @@ func scanH2FakePseudo(target *url.URL, path, host string, cfg config.Config, rep
 	if request.ContainsStr(resp, canary) {
 		rep.Emit(report.Finding{
 			Target:    target.String(),
+			Method:      "HTTP/2",
 			Severity:  report.SeverityProbable,
 			Type:      "H2-fake-pseudo",
 			Technique: "HTTP2FakePseudo",
@@ -115,6 +116,7 @@ func scanH2Scheme(target *url.URL, path, host string, cfg config.Config, rep *re
 	if request.ContainsStr(resp, canary) {
 		rep.Emit(report.Finding{
 			Target:    target.String(),
+			Method:      "HTTP/2",
 			Severity:  report.SeverityProbable,
 			Type:      "H2-scheme-reflection",
 			Technique: "HTTP2Scheme",
@@ -184,6 +186,7 @@ func scanH2DualPath(target *url.URL, path, host string, cfg config.Config, rep *
 
 	rep.Emit(report.Finding{
 		Target:    target.String(),
+		Method:      "HTTP/2",
 		Severity:  report.SeverityProbable,
 		Type:      "H2-dual-path",
 		Technique: "HTTP2DualPath",
@@ -222,6 +225,7 @@ func scanH2Method(target *url.URL, path, host string, cfg config.Config, rep *re
 	if request.ContainsStr(resp, canaryPath) || request.ContainsStr(resp, host+canaryPath) {
 		rep.Emit(report.Finding{
 			Target:    target.String(),
+			Method:      "HTTP/2",
 			Severity:  report.SeverityProbable,
 			Type:      "H2-method-reflection",
 			Technique: "HTTP2Method",
@@ -273,6 +277,7 @@ func scanHiddenHTTP2(target *url.URL, path, host string, cfg config.Config, rep 
 	// Signal: H1 path gives H1, explicit H2 path gives H2 → hidden H2
 	rep.Emit(report.Finding{
 		Target:    target.String(),
+		Method:      "HTTP/2",
 		Severity:  report.SeverityInfo,
 		Type:      "hidden-H2",
 		Technique: "HiddenHTTP2",

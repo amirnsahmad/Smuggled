@@ -87,6 +87,7 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg config.Config, rep *report
 			displayTerm := fmt.Sprintf("%q", term)
 			rep.Emit(report.Finding{
 				Target:    target.String(),
+				Method:      config.EffectiveMethods(cfg)[0],
 				Severity:  report.SeverityConfirmed,
 				Type:      "chunk-size-" + b.name,
 				Technique: b.name + "/" + displayTerm,

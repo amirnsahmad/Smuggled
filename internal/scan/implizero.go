@@ -88,6 +88,7 @@ func ScanImplicitZero(target *url.URL, base []byte, cfg config.Config, rep *repo
 		if st2 == 400 || st2 == 405 || bytes.Contains(r2, []byte(smuggledMethod)) {
 			rep.Emit(report.Finding{
 				Target:      target.String(),
+				Method:      config.EffectiveMethods(cfg)[0],
 				Severity:    report.SeverityProbable,
 				Type:        "implicit-zero-CL",
 				Technique:   "GET-chunked-smuggle",
@@ -140,6 +141,7 @@ func scanHeadDesync(target *url.URL, host, path string, cfg config.Config, rep *
 	if len(r2) > 0 && bytes.Contains(r2, []byte("GPOST")) {
 		rep.Emit(report.Finding{
 			Target:      target.String(),
+			Method:      config.EffectiveMethods(cfg)[0],
 			Severity:    report.SeverityProbable,
 			Type:        "implicit-zero-CL",
 			Technique:   "HEAD-body-smuggle",

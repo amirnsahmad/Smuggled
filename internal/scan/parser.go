@@ -114,6 +114,7 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep 
 
 				rep.Emit(report.Finding{
 					Target:      target.String(),
+					Method:      config.EffectiveMethods(cfg)[0],
 					Severity:    report.SeverityInfo,
 					Type:        "parser-discrepancy",
 					Technique:   string(hide) + "/" + canary.name,

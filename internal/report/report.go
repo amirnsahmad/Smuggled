@@ -44,6 +44,7 @@ type Finding struct {
 	Severity    Severity
 	Type        string   // "CL.TE", "TE.CL", "H2.CL", "parser-discrepancy", etc.
 	Technique   string   // permutation that triggered it
+	Method      string   // HTTP method used in the probe (GET, POST, HEAD, etc.)
 	Description string
 	Evidence    string
 	RawProbe    string // raw HTTP request bytes sent
@@ -78,8 +79,11 @@ func toVulnReport(f Finding) VulnReport {
 	// Extract hostname from target URL for asset field
 	asset := extractHost(f.Target)
 
-	// Build title
+	// Build title: "HTTP Request Smuggling — <Type> via <METHOD> (<technique>)"
 	title := fmt.Sprintf("HTTP Request Smuggling — %s", f.Type)
+	if f.Method != "" {
+		title = fmt.Sprintf("%s via %s", title, strings.ToUpper(f.Method))
+	}
 	if f.Technique != "" {
 		title = fmt.Sprintf("%s (%s)", title, f.Technique)
 	}

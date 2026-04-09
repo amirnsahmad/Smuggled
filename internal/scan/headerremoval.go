@@ -90,6 +90,7 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *rep
 
 	rep.Emit(report.Finding{
 		Target:   target.String(),
+		Method:      config.EffectiveMethods(cfg)[0],
 		Severity: report.SeverityProbable,
 		Type:     "header-removal",
 		Technique: "Keep-Alive-header-stripping",
