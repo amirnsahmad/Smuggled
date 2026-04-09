@@ -529,8 +529,15 @@ func extractPath(req []byte) string {
 	return string(parts[1])
 }
 
-// specialChars returns the list of byte values used for dynamic permutations,
-// mirroring DesyncBox.getSpecialChars().
+// specialChars returns the exact list of byte values used for dynamic permutations,
+// mirroring DesyncBox.getSpecialChars() in the Java original:
+//
+//	chars.add(0);   // null
+//	chars.add(9);   // tab
+//	chars.add(11);  // vert tab
+//	chars.add(12);  // form feed
+//	chars.add(13);  // \r
+//	chars.add(127); // DEL
 func specialChars() []int {
-	return []int{9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 127, 160, 173}
+	return []int{0, 9, 11, 12, 13, 127}
 }

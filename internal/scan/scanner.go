@@ -111,6 +111,9 @@ func (s *Scanner) runModules(u *url.URL, base []byte, cfg config.Config) {
 			ScanH2Tunnel(u, base, cfg, rep)
 			ScanHeadScanTE(u, base, cfg, rep)
 		}
+		if cfg.ResearchMode {
+			ScanH2Research(u, base, cfg, rep)
+		}
 	}
 
 	// ── Keep-Alive header removal ─────────────────────────────────────────────

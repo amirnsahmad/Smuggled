@@ -39,9 +39,10 @@ var (
 	flagSkipCL0          bool
 	flagSkipChunkSizes   bool
 	flagSkipH1Tunnel     bool
-	flagSkipH2Tunnel     bool
+	flagSkipH2Tunnel      bool
 	flagSkipHeaderRemoval bool
-	flagTechniques       []string
+	flagResearch          bool
+	flagTechniques        []string
 
 	rootCmd = &cobra.Command{
 		Use:   "smuggled",
@@ -119,6 +120,7 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagSkipH1Tunnel, "skip-h1-tunnel", false, "Skip H1 tunnel scans (HEAD/method-override)")
 	scanCmd.Flags().BoolVar(&flagSkipH2Tunnel, "skip-h2-tunnel", false, "Skip H2 tunnel and HeadScanTE (overrides --skip-h2 for tunnel only)")
 	scanCmd.Flags().BoolVar(&flagSkipHeaderRemoval, "skip-header-removal", false, "Skip Keep-Alive header removal scan")
+	scanCmd.Flags().BoolVar(&flagResearch, "research", false, "Enable research-mode H2 probes (HTTP2FakePseudo, HTTP2Scheme, HTTP2DualPath, HTTP2Method, HiddenHTTP2)")
 	scanCmd.Flags().StringSliceVar(&flagTechniques, "techniques", nil, "Comma-separated technique names to run (default: all). See 'techniques' subcommand.")
 
 	rootCmd.AddCommand(scanCmd)
@@ -190,6 +192,7 @@ func runScan(_ *cobra.Command, args []string) error {
 		SkipH1Tunnel:        flagSkipH1Tunnel,
 		SkipH2Tunnel:        flagSkipH2Tunnel || flagSkipH2,
 		SkipHeaderRemoval:   flagSkipHeaderRemoval,
+		ResearchMode:        flagResearch,
 		TechniquesFilter:    flagTechniques,
 	}
 

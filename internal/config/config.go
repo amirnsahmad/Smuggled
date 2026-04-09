@@ -43,6 +43,10 @@ type Config struct {
 	SkipH2Tunnel      bool
 	SkipHeaderRemoval bool
 
+	// ResearchMode enables experimental probes (HTTP2FakePseudo, HTTP2Scheme,
+	// HTTP2DualPath, HTTP2Method, HiddenHTTP2). Off by default.
+	ResearchMode bool
+
 	// TechniquesFilter: if non-empty only run techniques whose Name is in this list.
 	TechniquesFilter []string
 }
