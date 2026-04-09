@@ -29,16 +29,17 @@ var (
 	flagConfirm      int
 	flagMethods      []string
 	flagForceMethod  bool
+	flagAll          bool // master switch: enable everything including research
 
-	flagSkipH2           bool
-	flagSkipParser       bool
-	flagSkipClientDesync bool
-	flagSkipPause        bool
-	flagSkipImplicit     bool
-	flagSkipConnState    bool
-	flagSkipCL0          bool
-	flagSkipChunkSizes   bool
-	flagSkipH1Tunnel     bool
+	flagSkipH2            bool
+	flagSkipParser        bool
+	flagSkipClientDesync  bool
+	flagSkipPause         bool
+	flagSkipImplicit      bool
+	flagSkipConnState     bool
+	flagSkipCL0           bool
+	flagSkipChunkSizes    bool
+	flagSkipH1Tunnel      bool
 	flagSkipH2Tunnel      bool
 	flagSkipHeaderRemoval bool
 	flagResearch          bool
@@ -121,6 +122,10 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagSkipH2Tunnel, "skip-h2-tunnel", false, "Skip H2 tunnel and HeadScanTE (overrides --skip-h2 for tunnel only)")
 	scanCmd.Flags().BoolVar(&flagSkipHeaderRemoval, "skip-header-removal", false, "Skip Keep-Alive header removal scan")
 	scanCmd.Flags().BoolVar(&flagResearch, "research", false, "Enable research-mode H2 probes (HTTP2FakePseudo, HTTP2Scheme, HTTP2DualPath, HTTP2Method, HiddenHTTP2)")
+	scanCmd.Flags().BoolVarP(&flagAll, "all", "a", false,
+		"Enable ALL modules including research probes.\n"+
+			"  Equivalent to: --research + all --skip-* disabled + -m POST,GET,HEAD\n"+
+			"  Individual flags can still override: --all --skip-h2 disables H2 on top of --all.")
 	scanCmd.Flags().StringSliceVar(&flagTechniques, "techniques", nil, "Comma-separated technique names to run (default: all). See 'techniques' subcommand.")
 
 	rootCmd.AddCommand(scanCmd)
@@ -172,28 +177,71 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	rep := report.New(out, flagJSON, flagVerbose)
 
+	// --all: enable every module and method set; individual --skip-* flags
+	// applied afterwards can still narrow the scope.
+	methods         := flagMethods
+	skipH2          := flagSkipH2
+	skipParser      := flagSkipParser
+	skipClientDesync := flagSkipClientDesync
+	skipPause       := flagSkipPause
+	skipImplicit    := flagSkipImplicit
+	skipConnState   := flagSkipConnState
+	skipCL0         := flagSkipCL0
+	skipChunkSizes  := flagSkipChunkSizes
+	skipH1Tunnel    := flagSkipH1Tunnel
+	skipH2Tunnel    := flagSkipH2Tunnel
+	skipHeaderRemoval := flagSkipHeaderRemoval
+	researchMode    := flagResearch
+
+	if flagAll {
+		// Enable everything by default; explicit --skip-* flags still take effect
+		if len(methods) == 0 {
+			methods = []string{"POST", "GET", "HEAD"}
+		}
+		researchMode = true
+		// Only override skip flags if user did NOT explicitly set them
+		// Cobra doesn't expose whether a flag was explicitly set, so we use
+		// a simple convention: --all sets all to false unless user passed
+		// the corresponding --skip-X flag explicitly (which would override
+		// the default false). Since cobra defaults are false, if the flag is
+		// still false after parsing it means user didn't set it — which means
+		// --all correctly leaves them as false (= enabled).
+		// No extra work needed; skip flags default to false = don't skip.
+		_ = skipH2
+		_ = skipParser
+		_ = skipClientDesync
+		_ = skipPause
+		_ = skipImplicit
+		_ = skipConnState
+		_ = skipCL0
+		_ = skipChunkSizes
+		_ = skipH1Tunnel
+		_ = skipH2Tunnel
+		_ = skipHeaderRemoval
+	}
+
 	cfg := config.Config{
-		Timeout:             time.Duration(flagTimeout) * time.Second,
-		Proxy:               flagProxy,
-		SkipTLSVerify:       flagSkipTLS,
-		Verbose:             flagVerbose,
-		Workers:             flagWorkers,
-		ConfirmReps:         flagConfirm,
-		Methods:             flagMethods,
-		ForceMethod:         flagForceMethod,
-		SkipH2:              flagSkipH2,
-		SkipParser:          flagSkipParser,
-		SkipClientDesync:    flagSkipClientDesync,
-		SkipPause:           flagSkipPause,
-		SkipImplicitZero:    flagSkipImplicit,
-		SkipConnState: flagSkipConnState,
-		SkipCL0:             flagSkipCL0,
-		SkipChunkSizes:      flagSkipChunkSizes,
-		SkipH1Tunnel:        flagSkipH1Tunnel,
-		SkipH2Tunnel:        flagSkipH2Tunnel || flagSkipH2,
-		SkipHeaderRemoval:   flagSkipHeaderRemoval,
-		ResearchMode:        flagResearch,
-		TechniquesFilter:    flagTechniques,
+		Timeout:           time.Duration(flagTimeout) * time.Second,
+		Proxy:             flagProxy,
+		SkipTLSVerify:     flagSkipTLS,
+		Verbose:           flagVerbose,
+		Workers:           flagWorkers,
+		ConfirmReps:       flagConfirm,
+		Methods:           methods,
+		ForceMethod:       flagForceMethod,
+		SkipH2:            skipH2,
+		SkipParser:        skipParser,
+		SkipClientDesync:  skipClientDesync,
+		SkipPause:         skipPause,
+		SkipImplicitZero:  skipImplicit,
+		SkipConnState:     skipConnState,
+		SkipCL0:           skipCL0,
+		SkipChunkSizes:    skipChunkSizes,
+		SkipH1Tunnel:      skipH1Tunnel,
+		SkipH2Tunnel:      skipH2Tunnel || skipH2,
+		SkipHeaderRemoval: skipHeaderRemoval,
+		ResearchMode:      researchMode,
+		TechniquesFilter:  flagTechniques,
 	}
 
 	ch := make(chan string, len(targets))

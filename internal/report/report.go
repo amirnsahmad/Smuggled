@@ -181,6 +181,83 @@ func metaForType(t string) typeMeta {
 				"normalize Transfer-Encoding/Content-Length no processo de tradução.",
 		}
 
+	case t == "H2-fake-pseudo":
+		return typeMeta{
+			template: "hrs-h2-fake-pseudo",
+			cwe:      "CWE-74",
+			owasp:    "A03:2021",
+			references: []string{
+				"https://portswigger.net/research/http2",
+				"https://portswigger.net/web-security/request-smuggling/advanced/http2-exclusive-vectors",
+				"https://cwe.mitre.org/data/definitions/74.html",
+			},
+			remediation: "Rejeite ou sanitize headers HTTP/2 cujos valores contenham CRLF (\\r\\n). " +
+				"O proxy não deve interpretar pseudo-headers injetados via line injection em valores " +
+				"de headers regulares. Valide pseudo-headers (:path, :method, :scheme, :authority) " +
+				"separadamente dos headers de aplicação.",
+		}
+
+	case t == "H2-scheme-reflection":
+		return typeMeta{
+			template: "hrs-h2-scheme-reflection",
+			cwe:      "CWE-918",
+			owasp:    "A10:2021",
+			references: []string{
+				"https://portswigger.net/research/http2",
+				"https://portswigger.net/web-security/ssrf",
+				"https://cwe.mitre.org/data/definitions/918.html",
+			},
+			remediation: "Valide e normalize o pseudo-header :scheme antes de usar seu valor " +
+				"em redirects ou construção de URLs. Nunca use :scheme diretamente como URL base " +
+				"sem validação de allowlist. Rejeite :scheme com valores fora de 'http' e 'https'.",
+		}
+
+	case t == "H2-dual-path":
+		return typeMeta{
+			template: "hrs-h2-dual-path",
+			cwe:      "CWE-444",
+			owasp:    "A07:2021",
+			references: []string{
+				"https://portswigger.net/research/http2",
+				"https://portswigger.net/web-security/request-smuggling/advanced/http2-exclusive-vectors",
+				"https://cwe.mitre.org/data/definitions/444.html",
+			},
+			remediation: "Rejeite requests H2 com pseudo-headers duplicados (:path, :method, etc.). " +
+				"O RFC 9113 proíbe múltiplos pseudo-headers do mesmo tipo — o servidor deve retornar " +
+				"PROTOCOL_ERROR (RST_STREAM) em vez de aceitar o segundo valor.",
+		}
+
+	case t == "H2-method-reflection":
+		return typeMeta{
+			template: "hrs-h2-method-reflection",
+			cwe:      "CWE-918",
+			owasp:    "A10:2021",
+			references: []string{
+				"https://portswigger.net/research/http2",
+				"https://portswigger.net/web-security/ssrf",
+				"https://cwe.mitre.org/data/definitions/918.html",
+			},
+			remediation: "Valide o pseudo-header :method — deve conter apenas um token HTTP válido " +
+				"(GET, POST, etc.), nunca uma URL absoluta. Rejeite :method que contenha espaços, " +
+				"protocolo ou host. Não propague o valor de :method para chamadas internas sem validação.",
+		}
+
+	case t == "hidden-H2":
+		return typeMeta{
+			template: "hrs-hidden-h2",
+			cwe:      "CWE-444",
+			owasp:    "A07:2021",
+			references: []string{
+				"https://portswigger.net/research/http2",
+				"https://portswigger.net/web-security/request-smuggling/advanced",
+				"https://cwe.mitre.org/data/definitions/444.html",
+			},
+			remediation: "Se o servidor suporta HTTP/2, garanta que isso seja consistente em todas " +
+				"as camadas (proxy, load balancer, back-end). Um servidor que negocia H2 via ALPN " +
+				"mas responde H1 nas demais comunicações indica configuração inconsistente que " +
+				"pode ser explorada para ataques de downgrade H2→H1.",
+		}
+
 	case t == "parser-discrepancy":
 		return typeMeta{
 			template: "hrs-parser-discrepancy",
