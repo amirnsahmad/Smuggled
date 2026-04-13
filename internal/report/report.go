@@ -419,6 +419,14 @@ type Reporter struct {
 	out     io.Writer
 	jsonFmt bool
 	verbose bool
+	found   bool // set to true on first Emit
+}
+
+// Found reports whether at least one finding has been emitted.
+func (r *Reporter) Found() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.found
 }
 
 // New creates a new Reporter.
@@ -431,15 +439,15 @@ func (r *Reporter) Emit(f Finding) {
 	f.Time = time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.found = true
 
 	if r.jsonFmt {
 		report := toVulnReport(f)
-		b, err := json.MarshalIndent(report, "", "  ")
-		if err != nil {
+		enc := json.NewEncoder(r.out)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(report); err != nil {
 			fmt.Fprintf(r.out, `{"error": "marshal failed: %v"}`+"\n", err)
-			return
 		}
-		fmt.Fprintln(r.out, string(b))
 		return
 	}
 

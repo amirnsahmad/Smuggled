@@ -102,6 +102,27 @@ func (c *Conn) RecvWithTimeout(d time.Duration) ([]byte, time.Duration, bool) {
 	return buf[:n], elapsed, timedOut
 }
 
+// SendPartial writes all but the last byte of data, returning the held-back byte.
+// Used for last-byte-sync: the caller sends the final byte later to control timing.
+func (c *Conn) SendPartial(data []byte) (lastByte []byte, err error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("data too short for partial send")
+	}
+	c.conn.SetWriteDeadline(time.Now().Add(c.Timeout)) //nolint:errcheck
+	_, err = c.conn.Write(data[:len(data)-1])
+	if err != nil {
+		return nil, err
+	}
+	return data[len(data)-1:], nil
+}
+
+// SendByte writes a single byte (the held-back last byte from SendPartial).
+func (c *Conn) SendByte(b []byte) error {
+	c.conn.SetWriteDeadline(time.Now().Add(c.Timeout)) //nolint:errcheck
+	_, err := c.conn.Write(b)
+	return err
+}
+
 // Close closes the underlying connection.
 func (c *Conn) Close() {
 	if c.conn != nil {

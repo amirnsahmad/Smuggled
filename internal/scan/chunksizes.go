@@ -29,7 +29,18 @@ import (
 )
 
 // altTerminators are the non-standard line endings to try.
-var altTerminators = []string{"\n", "\r", "\rX", "\r\r"}
+// Expanded beyond the original 4 to cover space/tab-prefixed CRLF variants
+// and LF+CR ordering — each can expose different parser boundaries depending
+// on whether the front-end or back-end strips, ignores or counts the extra byte.
+var altTerminators = []string{
+	"\n",    // bare LF — RFC-non-compliant but accepted by many parsers
+	"\r",    // bare CR
+	"\rX",   // CR + garbage — some parsers read CR as line end, others read until LF
+	"\r\r",  // double CR — two line-end candidates
+	"\n\r",  // LF+CR — inverse of CRLF; confuses parsers that look for CR-first
+	" \r\n", // space-prefixed CRLF — front-ends may strip the space, back-ends may not
+	"\t\r\n", // tab-prefixed CRLF — same discrepancy with tab stripping
+}
 
 // ScanChunkSizes runs all 8 chunk-size parsing discrepancy probes.
 func ScanChunkSizes(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
@@ -43,6 +54,7 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg config.Config, rep *report
 	}
 
 	method := config.EffectiveMethod(cfg, true)
+	dbg(cfg, "ChunkSizes: starting, target=%s method=%s", host, method)
 
 	builders := []struct {
 		name  string
@@ -64,13 +76,18 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg config.Config, rep *report
 			payload := b.build(method, path, host, term)
 			rep.Log("ChunkSize %s term=%q target=%s", b.name, term, host)
 
-			_, _, timedOut, err := request.RawRequest(target, payload, cfg)
+			_, elapsed, timedOut, err := request.RawRequest(target, payload, cfg)
 			if err != nil {
+				dbg(cfg, "ChunkSizes [%s/%q]: error: %v", b.name, term, err)
 				continue
 			}
-			if !timedOut {
+			delayed := cfg.IsDelayed(elapsed)
+			if !timedOut && !delayed {
+				dbg(cfg, "ChunkSizes [%s/%q]: no timeout/delay (elapsed=%v)", b.name, term, elapsed)
 				continue
 			}
+			dbg(cfg, "ChunkSizes [%s/%q]: SIGNAL timeout=%v delayed=%v elapsed=%v — confirming...",
+				b.name, term, timedOut, delayed, elapsed)
 
 			// Confirm
 			confirmed := 0
@@ -80,6 +97,7 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg config.Config, rep *report
 					confirmed++
 				}
 			}
+			dbg(cfg, "ChunkSizes [%s/%q]: confirmed=%d/%d", b.name, term, confirmed, cfg.ConfirmReps)
 			if confirmed < cfg.ConfirmReps {
 				continue
 			}
@@ -98,6 +116,9 @@ func ScanChunkSizes(target *url.URL, base []byte, cfg config.Config, rep *report
 				RawProbe: request.Truncate(string(payload), 512),
 			})
 			rep.Log("ChunkSize [!] %s/%s confirmed on %s", b.name, displayTerm, target.String())
+			if cfg.ExitOnFind {
+				return
+			}
 		}
 	}
 }

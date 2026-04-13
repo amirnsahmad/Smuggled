@@ -95,13 +95,32 @@ func All() []Technique {
 		{Name: "h2CL", H2Only: true, Description: "Content-Length: 0 added"},
 	}
 
-	// Dynamic spacefix1, prefix1, suffix1, namesuffix1 for each special char
+	// ── Smuggler-derived static TE mutations ─────────────────────────────────
+	// Source: github.com/amirnsahmad/smuggler/blob/master/configs/default.py
+	base = append(base,
+		Technique{Name: "tabprefix2", Description: `Transfer-Encoding\t:\tchunked — tab before and after colon`},
+		Technique{Name: "TE-leadspace", Description: `" Transfer-Encoding: chunked" — leading space on header name ("nameprefix1" in smuggler)`},
+	)
+
+	// Dynamic spacefix1, prefix1, suffix1, namesuffix1 (original DesyncBox families)
+	// + TE-prespace, TE-xprespace, TE-endspacex, TE-rxprespace, TE-xnprespace,
+	//   TE-endspacerx, TE-endspacexn (smuggler-derived families)
+	// All use the 13-byte set from CLZeroBytes() (same as smuggler).
 	for _, i := range specialChars() {
 		base = append(base,
-			Technique{Name: fmt.Sprintf("spacefix1:%d", i), Description: fmt.Sprintf("space replaced with char 0x%02x before TE value", i)},
-			Technique{Name: fmt.Sprintf("prefix1:%d", i), Description: fmt.Sprintf("char 0x%02x appended to TE header name", i)},
-			Technique{Name: fmt.Sprintf("suffix1:%d", i), Description: fmt.Sprintf("char 0x%02x appended to TE value", i)},
-			Technique{Name: fmt.Sprintf("namesuffix1:%d", i), Description: fmt.Sprintf("char 0x%02x before colon in TE header name", i)},
+			// Original DesyncBox families
+			Technique{Name: fmt.Sprintf("spacefix1:%d", i), Description: fmt.Sprintf("Transfer-Encoding:<0x%02x>chunked (midspace)", i)},
+			Technique{Name: fmt.Sprintf("prefix1:%d", i), Description: fmt.Sprintf("Transfer-Encoding: <0x%02x>chunked (value prefix)", i)},
+			Technique{Name: fmt.Sprintf("suffix1:%d", i), Description: fmt.Sprintf("Transfer-Encoding: chunked<0x%02x> (endspace)", i)},
+			Technique{Name: fmt.Sprintf("namesuffix1:%d", i), Description: fmt.Sprintf("Transfer-Encoding<0x%02x>: chunked (postspace)", i)},
+			// Smuggler-derived families
+			Technique{Name: fmt.Sprintf("TE-prespace:%d", i), Description: fmt.Sprintf("<0x%02x>Transfer-Encoding: chunked (leading byte on header name)", i)},
+			Technique{Name: fmt.Sprintf("TE-xprespace:%d", i), Description: fmt.Sprintf("X: X<0x%02x>Transfer-Encoding: chunked (prev-header bleed)", i)},
+			Technique{Name: fmt.Sprintf("TE-endspacex:%d", i), Description: fmt.Sprintf("Transfer-Encoding: chunked<0x%02x>X: X (value bleed into dummy)", i)},
+			Technique{Name: fmt.Sprintf("TE-rxprespace:%d", i), Description: fmt.Sprintf("X: X\\r<0x%02x>Transfer-Encoding: chunked (CR+byte between headers)", i)},
+			Technique{Name: fmt.Sprintf("TE-xnprespace:%d", i), Description: fmt.Sprintf("X: X<0x%02x>\\nTransfer-Encoding: chunked (byte+LF between headers)", i)},
+			Technique{Name: fmt.Sprintf("TE-endspacerx:%d", i), Description: fmt.Sprintf("Transfer-Encoding: chunked\\r<0x%02x>X: X (CR+byte after value)", i)},
+			Technique{Name: fmt.Sprintf("TE-endspacexn:%d", i), Description: fmt.Sprintf("Transfer-Encoding: chunked<0x%02x>\\nX: X (byte+LF after value)", i)},
 		)
 	}
 
@@ -120,6 +139,45 @@ func All() []Technique {
 		Technique{Name: "CL-error", Description: "Invalid header injected before CL"},
 		Technique{Name: "CL-spacepad", Description: "Content-Length: <n> (trailing space)"},
 	)
+
+	// ── Dual CL header attacks ────────────────────────────────────────────────
+	base = append(base,
+		Technique{Name: "CL-dual-zero-first", Description: `Content-Length: 0\r\nContent-Length: <n> — front picks 0, back picks <n> or vice versa`},
+		Technique{Name: "CL-dual-zero-last", Description: `Content-Length: <n>\r\nContent-Length: 0 — front picks <n>, back picks 0 or vice versa`},
+	)
+
+	// ── CLZero-derived static CL mutations ───────────────────────────────────
+	// Source: github.com/Moopinger/CLZero/blob/main/configs/default.py
+	base = append(base,
+		Technique{Name: "CL-alpha", Description: `Content-Length: <n>aa (alpha suffix — "normalize" in CLZero)`},
+		Technique{Name: "CL-subtract", Description: `Content-Length: <n>-0 (arithmetic suffix — "subtract" in CLZero)`},
+		Technique{Name: "CL-under", Description: `Content_Length: <n> (underscore in name — "underjoin1" in CLZero)`},
+		Technique{Name: "CL-smashed", Description: `Content Length:<n> (space in name, no space after colon — "smashed" in CLZero)`},
+	)
+
+	// ── CLZero dynamic CL byte-family mutations ───────────────────────────────
+	// 10 position families × 13 special byte values = 130 permutations.
+	clFamilies := [10]string{
+		"CL-midspace",    // byte replaces space between colon and value
+		"CL-postspace",   // byte injected before the colon
+		"CL-prespace",    // byte prepended to the header name
+		"CL-endspace",    // byte appended after the value
+		"CL-xprespace",   // prev-header value bleeds into CL via byte (no CRLF)
+		"CL-endspacex",   // CL value bleeds into dummy token via byte
+		"CL-rxprespace",  // CR + byte between two headers
+		"CL-xnprespace",  // byte + LF between two headers
+		"CL-endspacerx",  // CR + byte after CL value
+		"CL-endspacexn",  // byte + LF after CL value
+	}
+	for _, b := range CLZeroBytes() {
+		sfx := fmt.Sprintf("-%02x", b)
+		for _, fam := range clFamilies {
+			base = append(base, Technique{
+				Name:        fam + sfx,
+				Description: fmt.Sprintf("%s with byte 0x%02x", fam, b),
+			})
+		}
+	}
 
 	return base
 }
@@ -254,7 +312,12 @@ func ApplyTE(req []byte, technique string) []byte {
 		result = replaceBytes(req, []byte(teFull), []byte("Transfer-Encoding: 'chunked'"))
 
 	case "dualchunk":
-		result = addOrReplaceHeader(req, "Transfer-encoding", "identity")
+		// INSERT Transfer-encoding: identity alongside the existing Transfer-Encoding: chunked.
+		// addOrReplaceHeader would REPLACE chunked with identity (case-insensitive match),
+		// leaving no real chunked header — back-end couldn't parse as chunked.
+		// appendHeader inserts without checking for existing headers of the same name,
+		// producing: Transfer-Encoding: chunked\r\nTransfer-encoding: identity (both present).
+		result = appendHeader(req, "Transfer-encoding", "identity")
 
 	case "lazygrep":
 		result = replaceBytes(req, []byte(teFull), []byte("Transfer-Encoding: chunk"))
@@ -317,6 +380,20 @@ func ApplyTE(req []byte, technique string) []byte {
 	case "http1.0":
 		result = replaceFirstBytes(req, []byte("HTTP/1.1"), []byte("HTTP/1.0"))
 
+	// ── Smuggler-derived static TE mutations ─────────────────────────────────
+	// Source: github.com/amirnsahmad/smuggler/blob/master/configs/default.py
+	case "tabprefix2":
+		// Transfer-Encoding\t:\tchunked — tab both before and after the colon.
+		// Distinct from tabprefix1 (spacefix1:9 = tab only after colon, no space).
+		result = replaceBytes(req, []byte(teHeader), []byte("Transfer-Encoding\t:\t"))
+	case "TE-leadspace":
+		// " Transfer-Encoding: chunked" — leading space on the header name.
+		// Known as "nameprefix1" in smuggler. Different from our "nameprefix1"
+		// which prefixes a full "Foo: bar\r\n" continuation line.
+		// Leading whitespace before the header name is illegal per RFC 7230 §3.2.4
+		// but some proxies normalise it, exposing the discrepancy to back-ends.
+		result = replaceBytes(req, []byte(teHeader), []byte(" "+teHeader))
+
 	case "h2CL":
 		result = addOrReplaceHeader(req, "Content-Length", "0")
 		return result
@@ -370,29 +447,91 @@ func ApplyTE(req []byte, technique string) []byte {
 		result = replaceBytes(req, []byte(teFull), []byte(replacement))
 
 	default:
-		// Dynamic techniques: spacefix1:N, prefix1:N, suffix1:N, namesuffix1:N
+		// Dynamic techniques:
+		//   Original (DesyncBox): spacefix1:N, prefix1:N, suffix1:N, namesuffix1:N
+		//   Smuggler-derived:     TE-prespace:N, TE-xprespace:N, TE-endspacex:N,
+		//                         TE-rxprespace:N, TE-xnprespace:N,
+		//                         TE-endspacerx:N, TE-endspacexn:N
+		// All families iterated over 13 special bytes (same set as CLZeroBytes).
 		for _, sc := range specialChars() {
-			prefix := fmt.Sprintf("spacefix1:%d", sc)
-			if technique == prefix {
-				old := []byte(teHeader) // "Transfer-Encoding: "
-				newH := append([]byte("Transfer-Encoding:"), byte(sc))
+			b := []byte{byte(sc)}
+
+			if technique == fmt.Sprintf("spacefix1:%d", sc) {
+				// Transfer-Encoding:<byte>chunked — byte replaces the space after colon.
+				// Known as "midspace" in smuggler.
+				old := []byte(teHeader)
+				newH := append([]byte("Transfer-Encoding:"), b...)
 				result = replaceBytes(req, old, newH)
 				goto done
 			}
 			if technique == fmt.Sprintf("prefix1:%d", sc) {
-				old := []byte(teFull)
-				newH := append([]byte(teFull), byte(sc))
+				// Transfer-Encoding: <byte>chunked — byte injected between space and value.
+				// Not in smuggler; tests parsers that strip leading garbage from the value.
+				old := []byte("Transfer-Encoding: chunked")
+				newH := append([]byte("Transfer-Encoding: "), b...)
+				newH = append(newH, []byte("chunked")...)
 				result = replaceBytes(req, old, newH)
 				goto done
 			}
 			if technique == fmt.Sprintf("suffix1:%d", sc) {
+				// Transfer-Encoding: chunked<byte> — byte appended after the value.
+				// Known as "endspace" in smuggler.
 				old := []byte(teFull)
-				newH := append([]byte(teFull), byte(sc))
+				newH := append([]byte(teFull), b...)
 				result = replaceBytes(req, old, newH)
 				goto done
 			}
 			if technique == fmt.Sprintf("namesuffix1:%d", sc) {
-				result = replaceBytes(req, []byte("Transfer-Encoding:"), []byte("Transfer-Encoding"+string(rune(sc))+":"))
+				// Transfer-Encoding<byte>: chunked — byte injected before the colon.
+				// Known as "postspace" in smuggler.
+				result = replaceBytes(req, []byte("Transfer-Encoding:"), append(append([]byte("Transfer-Encoding"), b...), ':'))
+				goto done
+			}
+
+			// ── Smuggler-derived dynamic families ──────────────────────────────
+			// Source: github.com/amirnsahmad/smuggler/blob/master/configs/default.py
+			if technique == fmt.Sprintf("TE-prespace:%d", sc) {
+				// <byte>Transfer-Encoding: chunked — byte prepended to the header name.
+				// Front-end may discard the unknown header; back-end strips the byte → TE.
+				result = replaceBytes(req, []byte(teFull), append(b, []byte(teFull)...))
+				goto done
+			}
+			if technique == fmt.Sprintf("TE-xprespace:%d", sc) {
+				// X: X<byte>Transfer-Encoding: chunked
+				// Previous header value bleeds into TE name via byte (no CRLF between them).
+				result = replaceBytes(req, []byte(teFull),
+					append(append([]byte("X: X"), b...), []byte(teFull)...))
+				goto done
+			}
+			if technique == fmt.Sprintf("TE-endspacex:%d", sc) {
+				// Transfer-Encoding: chunked<byte>X: X
+				// TE value bleeds into a dummy subsequent token via the byte.
+				result = replaceBytes(req, []byte(teFull),
+					append(append([]byte(teFull), b...), []byte("X: X")...))
+				goto done
+			}
+			if technique == fmt.Sprintf("TE-rxprespace:%d", sc) {
+				// X: X\r<byte>Transfer-Encoding: chunked — CR + byte between two headers.
+				result = replaceBytes(req, []byte(teFull),
+					append(append([]byte("X: X\r"), b...), []byte(teFull)...))
+				goto done
+			}
+			if technique == fmt.Sprintf("TE-xnprespace:%d", sc) {
+				// X: X<byte>\nTransfer-Encoding: chunked — byte + LF between two headers.
+				result = replaceBytes(req, []byte(teFull),
+					append(append(append([]byte("X: X"), b...), '\n'), []byte(teFull)...))
+				goto done
+			}
+			if technique == fmt.Sprintf("TE-endspacerx:%d", sc) {
+				// Transfer-Encoding: chunked\r<byte>X: X — CR + byte after TE value.
+				result = replaceBytes(req, []byte(teFull),
+					append(append(append([]byte(teFull), '\r'), b...), []byte("X: X")...))
+				goto done
+			}
+			if technique == fmt.Sprintf("TE-endspacexn:%d", sc) {
+				// Transfer-Encoding: chunked<byte>\nX: X — byte + LF after TE value.
+				result = replaceBytes(req, []byte(teFull),
+					append(append(append([]byte(teFull), b...), '\n'), []byte("X: X")...))
 				goto done
 			}
 		}
@@ -434,11 +573,110 @@ func ApplyCL(req []byte, technique, clValue string) []byte {
 		return addOrReplaceHeader(req, "Expect", "x 100-continue")
 	case "CL-error":
 		return replaceBytes(req, []byte(clHeader+clValue), []byte("X-Invalid Y: \r\n"+clHeader+clValue))
+
+	// ── Dual Content-Length header attacks ──────────────────────────────────
+	// Send two Content-Length headers with conflicting values.
+	// RFC 7230 §3.3.2 says the request MUST be rejected if two CL values differ;
+	// in practice proxies and back-ends disagree on which one wins:
+	//   - Some proxies take the FIRST CL; some back-ends take the LAST → desync.
+	//   - Some proxies take the LAST CL; some back-ends take the FIRST → desync.
+	// Both orderings are tested independently.
+	case "CL-dual-zero-first":
+		// "Content-Length: 0\r\nContent-Length: <n>"
+		// Front-end that takes the FIRST CL (=0) forwards 0 bytes of body;
+		// back-end that takes the LAST CL (=<n>) tries to read <n> bytes → timeout.
+		// Back-end that takes the FIRST (=0) treats body as next pipelined request → CL.0.
+		return replaceBytes(req, []byte(clHeader+clValue), []byte("Content-Length: 0\r\n"+clHeader+clValue))
+	case "CL-dual-zero-last":
+		// "Content-Length: <n>\r\nContent-Length: 0"
+		// Front-end that takes the LAST CL (=0) forwards 0 bytes;
+		// back-end that takes the FIRST CL (=<n>) reads full body → no desync.
+		// Front-end that takes the FIRST CL (=<n>) forwards full body;
+		// back-end that takes the LAST (=0) treats body as next request → CL.0.
+		return replaceBytes(req, []byte(clHeader+clValue), []byte(clHeader+clValue+"\r\nContent-Length: 0"))
+
+	// ── CLZero-derived static mutations ─────────────────────────────────────
+	// Source: github.com/Moopinger/CLZero/blob/main/configs/default.py
+	case "CL-alpha":
+		// "Content-Length: <n>aa" — alpha suffix; parsers expecting digits-only reject the value
+		return replaceBytes(req, []byte(clHeader+clValue), []byte(clHeader+clValue+"aa"))
+	case "CL-subtract":
+		// "Content-Length: <n>-0" — arithmetic suffix some parsers evaluate to 0
+		return replaceBytes(req, []byte(clHeader+clValue), []byte(clHeader+clValue+"-0"))
+	case "CL-under":
+		// "Content_Length: <n>" — underscore replaces hyphen; most proxies ignore this header
+		return replaceBytes(req, []byte(clHeader+clValue), []byte("Content_Length: "+clValue))
+	case "CL-smashed":
+		// "Content Length:<n>" — space in name + no space after colon; parser confusion
+		return replaceBytes(req, []byte(clHeader+clValue), []byte("Content Length:"+clValue))
 	}
+
+	// ── CLZero dynamic byte-family mutations ─────────────────────────────────
+	// 10 position families × 13 special byte values = 130 permutations.
+	// Each family injects a single byte into a specific structural position of the
+	// Content-Length header line to exploit parsing discrepancies between components.
+	clFull := []byte(clHeader + clValue)
+	for _, b := range CLZeroBytes() {
+		sfx := fmt.Sprintf("-%02x", b)
+		bc := []byte{byte(b)}
+
+		switch technique {
+		case "CL-midspace" + sfx:
+			// Content-Length:<byte><value> — byte replaces the space between colon and value
+			return bytes.Join([][]byte{[]byte("Content-Length:"), bc, []byte(clValue)}, nil)
+		case "CL-postspace" + sfx:
+			// Content-Length<byte>: <value> — byte injected immediately before the colon
+			return bytes.Join([][]byte{[]byte("Content-Length"), bc, []byte(": " + clValue)}, nil)
+		case "CL-prespace" + sfx:
+			// <byte>Content-Length: <value> — byte prepended to the header name
+			return bytes.Join([][]byte{bc, clFull}, nil)
+		case "CL-endspace" + sfx:
+			// Content-Length: <value><byte> — byte appended directly after the value
+			return bytes.Join([][]byte{clFull, bc}, nil)
+		case "CL-xprespace" + sfx:
+			// X: X<byte>Content-Length: <value>
+			// Previous header's value bleeds into CL via the special byte (no CRLF between them).
+			// Front-ends may see one folded header; back-ends may split and recognise CL.
+			return bytes.Join([][]byte{[]byte("X: X"), bc, clFull}, nil)
+		case "CL-endspacex" + sfx:
+			// Content-Length: <value><byte>X: X
+			// CL value bleeds into a dummy token; some parsers ignore the trailing junk.
+			return bytes.Join([][]byte{clFull, bc, []byte("X: X")}, nil)
+		case "CL-rxprespace" + sfx:
+			// X: X\r<byte>Content-Length: <value> — CR + byte between the two headers
+			return bytes.Join([][]byte{[]byte("X: X\r"), bc, clFull}, nil)
+		case "CL-xnprespace" + sfx:
+			// X: X<byte>\nContent-Length: <value> — byte + LF between the two headers
+			return bytes.Join([][]byte{[]byte("X: X"), bc, []byte("\n"), clFull}, nil)
+		case "CL-endspacerx" + sfx:
+			// Content-Length: <value>\r<byte>X: X — CR + byte after CL value
+			return bytes.Join([][]byte{clFull, []byte("\r"), bc, []byte("X: X")}, nil)
+		case "CL-endspacexn" + sfx:
+			// Content-Length: <value><byte>\nX: X — byte + LF after CL value
+			return bytes.Join([][]byte{clFull, bc, []byte("\n"), []byte("X: X")}, nil)
+		}
+	}
+
 	return req
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+// appendHeader inserts a new header line before \r\n\r\n WITHOUT checking for
+// an existing header of the same name. Used when two headers with the same name
+// must coexist (e.g. dualchunk: Transfer-Encoding: chunked + Transfer-encoding: identity).
+func appendHeader(req []byte, name, value string) []byte {
+	sep := []byte("\r\n\r\n")
+	idx := bytes.Index(req, sep)
+	if idx < 0 {
+		return req
+	}
+	var buf bytes.Buffer
+	buf.Write(req[:idx])
+	buf.WriteString("\r\n" + name + ": " + value)
+	buf.Write(req[idx:])
+	return buf.Bytes()
+}
 
 func replaceBytes(src, old, newB []byte) []byte {
 	return bytes.Replace(src, old, newB, 1)
@@ -529,15 +767,20 @@ func extractPath(req []byte) string {
 	return string(parts[1])
 }
 
-// specialChars returns the exact list of byte values used for dynamic permutations,
-// mirroring DesyncBox.getSpecialChars() in the Java original:
+// CLZeroBytes returns the set of byte values used in CLZero's dynamic Content-Length
+// permutation families. Each byte is injected into a specific structural position of
+// the Content-Length header line to probe parser inconsistencies.
+// Source: github.com/Moopinger/CLZero/blob/main/configs/default.py
+func CLZeroBytes() []int {
+	return []int{0x01, 0x04, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1f, 0x20, 0x7f, 0xa0, 0xff}
+}
+
+// specialChars returns the set of byte values used for dynamic TE permutations.
+// Expanded to match the full set used by github.com/amirnsahmad/smuggler and
+// github.com/Moopinger/CLZero — 13 bytes that trigger parsing discrepancies
+// in various proxies and back-end servers.
 //
-//	chars.add(0);   // null
-//	chars.add(9);   // tab
-//	chars.add(11);  // vert tab
-//	chars.add(12);  // form feed
-//	chars.add(13);  // \r
-//	chars.add(127); // DEL
+// Original Java DesyncBox set (6 bytes) is a strict subset of this list.
 func specialChars() []int {
-	return []int{0, 9, 11, 12, 13, 127}
+	return CLZeroBytes()
 }
