@@ -31,8 +31,26 @@ import (
 
 const headerRemovalCanary = "wrtzwrrrrr"
 
+// headerStripTarget defines one hop-by-hop stripping probe.
+type headerStripTarget struct {
+	strip   string // header name to list in Connection (gets stripped by proxy)
+	body    string // request body to send
+	typeTag string // finding Type label
+	desc    string // human-readable description of the attack surface
+}
+
 // ScanHeaderRemoval probes for proxy header-stripping via Keep-Alive abuse.
+//
+// Variants tested:
+//
+//   - host: proxy strips the Host header → injected Host in body may be used by backend.
+//
+//   - content-length: proxy strips Content-Length → backend has no CL and no TE.
+//     RFC 7230 requires CL or TE for a request with a body; without either the backend
+//     may default to CL=0 (leaving the body as a new request — a CL.0 variant), return
+//     411 Length Required, or hang. All of these represent a desync-relevant anomaly.
 func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
+	dbg(cfg, "HeaderRemoval: starting, target=%s", target.Host)
 	host := target.Hostname()
 	if p := target.Port(); p != "" {
 		host = host + ":" + p
@@ -42,23 +60,53 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *rep
 		path = "/"
 	}
 
-	body := "Host: " + headerRemovalCanary
+	stripTargets := []headerStripTarget{
+		{
+			strip:   "host",
+			body:    "Host: " + headerRemovalCanary,
+			typeTag: "header-removal",
+			desc: "Proxy strips the Host header listed in Connection hop-by-hop, " +
+				"enabling Host header injection via the request body.",
+		},
+		{
+			// Stripping Content-Length leaves the backend with a body and no length signal.
+			// Back-ends that default to CL=0 will treat the body as the next pipelined
+			// request — a CL.0 desync variant triggered purely by header removal.
+			// Back-ends that return 411 or 400 signal anomalous behaviour worth confirming.
+			strip:   "content-length",
+			body:    "Host: " + headerRemovalCanary,
+			typeTag: "header-removal-cl",
+			desc: "Proxy strips Content-Length listed in Connection hop-by-hop. " +
+				"Backend receives a POST with body but without CL or TE — may default to " +
+				"CL=0, creating a CL.0-style desync, or return 411/400.",
+		},
+	}
 
-	// Build attack (with Keep-Alive header) and harmless (without)
-	attack := buildHeaderRemovalReq(path, host, body, true)
-	harmless := buildHeaderRemovalReq(path, host, body, false)
+	for _, st := range stripTargets {
+		runHeaderStripProbe(target, path, host, st, cfg, rep)
+	}
+}
+
+// runHeaderStripProbe executes one header-stripping probe and reports if a signal is found.
+func runHeaderStripProbe(target *url.URL, path, host string, st headerStripTarget, cfg config.Config, rep *report.Reporter) {
+	attack := buildHeaderRemovalReqFor(path, host, st.body, st.strip, true)
+	harmless := buildHeaderRemovalReqFor(path, host, st.body, st.strip, false)
 
 	harmlessResp, _, _, harmlessErr := request.RawRequest(target, harmless, cfg)
 	if harmlessErr != nil {
 		return
 	}
-
 	attackResp, _, _, attackErr := request.RawRequest(target, attack, cfg)
 	if attackErr != nil {
 		return
 	}
 
-	// If responses are identical, not interesting
+	dbg(cfg, "HeaderRemoval[%s]: harmless_status=%d attack_status=%d canary_in_attack=%v canary_in_harmless=%v",
+		st.strip,
+		request.StatusCode(harmlessResp), request.StatusCode(attackResp),
+		request.ContainsStr(attackResp, headerRemovalCanary),
+		request.ContainsStr(harmlessResp, headerRemovalCanary))
+
 	if request.StatusCode(attackResp) == request.StatusCode(harmlessResp) &&
 		request.ContainsStr(attackResp, headerRemovalCanary) == request.ContainsStr(harmlessResp, headerRemovalCanary) {
 		return
@@ -77,8 +125,9 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *rep
 			diffCount++
 		}
 	}
+	dbg(cfg, "HeaderRemoval[%s]: stability diffCount=%d/5", st.strip, diffCount)
 	if diffCount < 3 {
-		return // not stable enough
+		return
 	}
 
 	// Final out-of-order check to filter round-robin noise
@@ -89,37 +138,45 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *rep
 	}
 
 	rep.Emit(report.Finding{
-		Target:   target.String(),
-		Method:      config.EffectiveMethods(cfg)[0],
-		Severity: report.SeverityProbable,
-		Type:     "header-removal",
-		Technique: "Keep-Alive-header-stripping",
+		Target:    target.String(),
+		Method:    config.EffectiveMethods(cfg)[0],
+		Severity:  report.SeverityProbable,
+		Type:      st.typeTag,
+		Technique: "Keep-Alive-" + st.strip + "-stripping",
 		Description: fmt.Sprintf(
-			"Header removal vulnerability detected: Keep-Alive header caused different "+
-				"response (status %d vs %d, canary-in-attack=%v vs canary-in-harmless=%v). "+
-				"The proxy may be stripping headers listed in Keep-Alive, enabling "+
-				"Host header injection.",
+			"%s Response divergence: attack status=%d harmless status=%d "+
+				"(canary-in-attack=%v canary-in-harmless=%v).",
+			st.desc,
 			request.StatusCode(attackResp), request.StatusCode(harmlessResp),
 			request.ContainsStr(attackResp, headerRemovalCanary),
 			request.ContainsStr(harmlessResp, headerRemovalCanary)),
 		Evidence: fmt.Sprintf(
-			"attack_status=%d harmless_status=%d canary=%s",
-			request.StatusCode(attackResp), request.StatusCode(harmlessResp), headerRemovalCanary),
+			"strip=%s attack_status=%d harmless_status=%d canary=%s",
+			st.strip, request.StatusCode(attackResp), request.StatusCode(harmlessResp), headerRemovalCanary),
 		RawProbe: request.Truncate(string(attack), 512),
 	})
-	rep.Log("HeaderRemoval [!] confirmed on %s", target.String())
+	rep.Log("HeaderRemoval [!] strip=%s confirmed on %s", st.strip, target.String())
 }
 
-func buildHeaderRemovalReq(path, host, body string, withKeepAlive bool) []byte {
+// buildHeaderRemovalReqFor builds an attack or harmless request for a given strip target.
+//
+// attack=true: lists `strip` header in Connection → proxy strips it before forwarding.
+// attack=false: uses Eat-Alive instead of Keep-Alive so no stripping occurs (control).
+func buildHeaderRemovalReqFor(path, host, body, strip string, attack bool) []byte {
 	var b strings.Builder
 	b.WriteString("POST " + path + " HTTP/1.1\r\n")
 	b.WriteString("Host: " + host + "\r\n")
 	b.WriteString("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n")
 	b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
 	b.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
-	b.WriteString("Connection: keep-alive\r\n")
-	if withKeepAlive {
+	if attack {
+		// List the target header as hop-by-hop so the proxy strips it.
+		b.WriteString("Connection: keep-alive, " + strip + "\r\n")
 		b.WriteString("Keep-Alive: timeout=5, max=1000\r\n")
+	} else {
+		// Control: same structure but Connection lists nothing harmful.
+		b.WriteString("Connection: keep-alive\r\n")
+		b.WriteString("Eat-Alive: timeout=5, max=1000\r\n")
 	}
 	b.WriteString("\r\n")
 	b.WriteString(body)

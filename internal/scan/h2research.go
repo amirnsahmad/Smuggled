@@ -36,10 +36,11 @@ import (
 
 // ScanH2Research runs all five H2 research-mode probes.
 func ScanH2Research(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
+	cfg = cfg.WithDebugScope("H2Research")
 	if target.Scheme != "https" {
 		return
 	}
-	if !supportsH2(target, cfg) {
+	if !request.ProbeH2(target, cfg) {
 		rep.Log("H2Research: %s does not negotiate h2, skipping", target.Host)
 		return
 	}
@@ -76,7 +77,8 @@ func scanH2FakePseudo(target *url.URL, path, host string, cfg config.Config, rep
 		return
 	}
 
-	if request.ContainsStr(resp, canary) {
+	dbg(cfg, "H2FakePseudo: resp status=%d canary_found=%v", resp.Status, request.ContainsStr(resp.Body, canary))
+	if request.ContainsStr(resp.Body, canary) {
 		rep.Emit(report.Finding{
 			Target:    target.String(),
 			Method:      "HTTP/2",
@@ -113,7 +115,8 @@ func scanH2Scheme(target *url.URL, path, host string, cfg config.Config, rep *re
 		return
 	}
 
-	if request.ContainsStr(resp, canary) {
+	dbg(cfg, "H2Scheme: resp status=%d canary_found=%v", resp.Status, request.ContainsStr(resp.Body, canary))
+	if request.ContainsStr(resp.Body, canary) {
 		rep.Emit(report.Finding{
 			Target:    target.String(),
 			Method:      "HTTP/2",
@@ -139,7 +142,10 @@ func scanH2Scheme(target *url.URL, path, host string, cfg config.Config, rep *re
 func scanH2DualPath(target *url.URL, path, host string, cfg config.Config, rep *report.Reporter) {
 	canary := "asdfwrtzXsmuggled"
 
-	// Probe 1: duplicate :path with same value — if server rejects (4xx), dual :path unsupported
+	// Probe 1: CRLF-injected duplicate :path with same value — if server rejects (4xx), dual :path unsupported.
+	// The :path override in extraHeaders replaces the default :path, so the HPACK frame
+	// contains a single :path whose *value* embeds "\r\n:path: <path>" — the CRLF injection
+	// is the attack vector, not duplicate pseudo-header keys.
 	extraHeaders1 := map[string]string{
 		":path": path + "\r\n:path: " + path,
 	}
@@ -148,7 +154,8 @@ func scanH2DualPath(target *url.URL, path, host string, cfg config.Config, rep *
 	if err != nil {
 		return
 	}
-	status1 := request.StatusCode(resp1)
+	status1 := resp1.Status
+	dbg(cfg, "H2DualPath: probe1 status=%d", status1)
 	if status1 >= 400 || status1 == 0 {
 		return // server rejected dual :path — not vulnerable
 	}
@@ -161,7 +168,7 @@ func scanH2DualPath(target *url.URL, path, host string, cfg config.Config, rep *
 	if err != nil {
 		return
 	}
-	status2 := request.StatusCode(resp2)
+	status2 := resp2.Status
 
 	// Probe 3: first :path is canary
 	extraHeaders3 := map[string]string{
@@ -171,15 +178,15 @@ func scanH2DualPath(target *url.URL, path, host string, cfg config.Config, rep *
 	if err != nil {
 		return
 	}
-	status3 := request.StatusCode(resp3)
+	status3 := resp3.Status
 
 	// Signal: statuses diverge between the two orderings → server processes one :path differently
 	if status1 == status2 && status1 == status3 {
 		return // all same — no path confusion
 	}
 
-	reflected2 := request.ContainsStr(resp2, canary)
-	reflected3 := request.ContainsStr(resp3, canary)
+	reflected2 := request.ContainsStr(resp2.Body, canary)
+	reflected3 := request.ContainsStr(resp3.Body, canary)
 
 	evidence := fmt.Sprintf("baseline=%d dual-path-A=%d dual-path-B=%d reflected-A=%v reflected-B=%v",
 		status1, status2, status3, reflected2, reflected3)
@@ -209,7 +216,7 @@ func scanH2DualPath(target *url.URL, path, host string, cfg config.Config, rep *
 func scanH2Method(target *url.URL, path, host string, cfg config.Config, rep *report.Reporter) {
 	// Use the target hostname with a distinctive path as the canary
 	// (avoids external DNS lookups; we look for path reflection instead)
-	canaryPath := "/smuggled-method-canary-xzyw"
+	canaryPath := config.EffectiveCanaryPath(cfg) + "-method"
 	methodValue := fmt.Sprintf("GET http://%s%s HTTP/1.1", host, canaryPath)
 	extraHeaders := map[string]string{
 		":method": methodValue,
@@ -222,7 +229,8 @@ func scanH2Method(target *url.URL, path, host string, cfg config.Config, rep *re
 		return
 	}
 
-	if request.ContainsStr(resp, canaryPath) || request.ContainsStr(resp, host+canaryPath) {
+	dbg(cfg, "H2Method: resp status=%d canary_found=%v", resp.Status, request.ContainsStr(resp.Body, canaryPath))
+	if request.ContainsStr(resp.Body, canaryPath) || request.ContainsStr(resp.Body, host+canaryPath) {
 		rep.Emit(report.Finding{
 			Target:    target.String(),
 			Method:      "HTTP/2",
@@ -263,17 +271,17 @@ func scanHiddenHTTP2(target *url.URL, path, host string, cfg config.Config, rep 
 		return // server already announces H2 on normal requests
 	}
 
-	// H2 response via ALPN
+	// H2 response via ALPN.
+	// h2RawRequest already verifies that h2 was negotiated via ALPN before sending.
+	// A non-zero status code confirms the server processed the H2 request.
 	h2Resp, err := h2RawRequest(target, "GET", path, host, "", nil, cfg)
-	if err != nil || len(h2Resp) == 0 {
+	if err != nil || h2Resp.Status == 0 {
 		return
 	}
+	// h2RawRequest only returns without error when h2 was ALPN-negotiated,
+	// so reaching here already proves hidden H2 support (H1 response confirmed above).
 
-	// H2 response must show HTTP/2
-	if !request.ContainsStr(h2Resp, "HTTP/2") && !request.ContainsStr(h2Resp, "200") {
-		return
-	}
-
+	h2Body := h2Resp.Body
 	// Signal: H1 path gives H1, explicit H2 path gives H2 → hidden H2
 	rep.Emit(report.Finding{
 		Target:    target.String(),
@@ -285,9 +293,9 @@ func scanHiddenHTTP2(target *url.URL, path, host string, cfg config.Config, rep 
 			"TLS requests but negotiates HTTP/2 when ALPN explicitly offers 'h2'. " +
 			"This target supports H2→H1 downgrade attacks even if H2 is not " +
 			"advertised publicly.",
-		Evidence:    "h1_response=HTTP/1.x; h2_alpn_response=HTTP/2",
+		Evidence:    fmt.Sprintf("h1_response=HTTP/1.x; h2_alpn_status=%d", h2Resp.Status),
 		RawProbe:    fmt.Sprintf("GET %s HTTP/1.1 (no ALPN h2) vs GET %s HTTP/2 (ALPN h2)", path, path),
-		RawResponse: request.Truncate(fmt.Sprintf("H1: %s\nH2: %s", string(h1Resp[:min(100, len(h1Resp))]), string(h2Resp[:min(100, len(h2Resp))])), 300),
+		RawResponse: request.Truncate(fmt.Sprintf("H1: %s\nH2: %s", string(h1Resp[:min(100, len(h1Resp))]), string(h2Body[:min(100, len(h2Body))])), 300),
 	})
 	rep.Log("HiddenHTTP2 [!] hidden H2 support detected on %s", target.String())
 }

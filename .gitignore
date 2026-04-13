@@ -1,6 +1,9 @@
 # Binaries
 bin/
 smuggled
+smuggler
+smuggled.exe
+smuggler.exe
 
 # Go
 *.test
@@ -16,3 +19,12 @@ vendor/
 
 # Build artifacts
 dist/
+output/
+
+# Local test / scratch files
+saida.txt
+teste-api-ppay.txt
+teste/
+
+# Claude Code internals
+.claude/

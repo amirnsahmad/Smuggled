@@ -22,6 +22,7 @@ var (
 	flagTimeout      int
 	flagWorkers      int
 	flagVerbose      bool
+	flagDebug        int
 	flagJSON         bool
 	flagOutput       string
 	flagProxy        string
@@ -30,7 +31,11 @@ var (
 	flagMethods      []string
 	flagForceMethod  bool
 	flagAll          bool // master switch: enable everything including research
+	flagHTTP1        bool // restrict to HTTP/1.1 scanners
+	flagHTTP2        bool // restrict to HTTP/2 scanners
 
+	flagSkipCLTE          bool
+	flagSkipTECL          bool
 	flagSkipH2            bool
 	flagSkipParser        bool
 	flagSkipClientDesync  bool
@@ -42,8 +47,15 @@ var (
 	flagSkipH1Tunnel      bool
 	flagSkipH2Tunnel      bool
 	flagSkipHeaderRemoval bool
+	flagSkipPathCRLF      bool
 	flagResearch          bool
+	flagExitOnFind        bool
+	flagCalibrate         bool
 	flagTechniques        []string
+	flagCanaryPath        string
+	flagModules           []string
+	flagHeaders           []string
+	flagAttempts          int
 
 	rootCmd = &cobra.Command{
 		Use:   "smuggled",
@@ -98,6 +110,10 @@ func init() {
 	scanCmd.Flags().IntVarP(&flagTimeout, "timeout", "t", 10, "Request timeout in seconds")
 	scanCmd.Flags().IntVarP(&flagWorkers, "workers", "w", 5, "Number of concurrent workers")
 	scanCmd.Flags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose output")
+	scanCmd.Flags().IntVar(&flagDebug, "debug", 0,
+		"Debug level: 1 = probe summary (first line + status/elapsed),\n"+
+			"  2 = full raw dump of every request and response sent/received.\n"+
+			"  Usage: --debug 1  or  --debug 2")
 	scanCmd.Flags().BoolVarP(&flagJSON, "json", "j", false, "JSON output (one finding per line)")
 	scanCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "Write output to file")
 	scanCmd.Flags().StringVarP(&flagProxy, "proxy", "p", "", "HTTP proxy URL (e.g. http://127.0.0.1:8080)")
@@ -110,6 +126,8 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagForceMethod, "force-method", false,
 		"Force chosen method(s) even on body-bearing probes (CL.TE, TE.CL). May reduce findings.")
 
+	scanCmd.Flags().BoolVar(&flagSkipCLTE, "skip-clte", false, "Skip CL.TE desync scans")
+	scanCmd.Flags().BoolVar(&flagSkipTECL, "skip-tecl", false, "Skip TE.CL desync scans")
 	scanCmd.Flags().BoolVar(&flagSkipH2, "skip-h2", false, "Skip HTTP/2 downgrade, H2 tunnel and HeadScanTE scans")
 	scanCmd.Flags().BoolVar(&flagSkipParser, "skip-parser", false, "Skip parser discrepancy scans")
 	scanCmd.Flags().BoolVar(&flagSkipClientDesync, "skip-client-desync", false, "Skip client-side desync scans")
@@ -121,12 +139,44 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagSkipH1Tunnel, "skip-h1-tunnel", false, "Skip H1 tunnel scans (HEAD/method-override)")
 	scanCmd.Flags().BoolVar(&flagSkipH2Tunnel, "skip-h2-tunnel", false, "Skip H2 tunnel and HeadScanTE (overrides --skip-h2 for tunnel only)")
 	scanCmd.Flags().BoolVar(&flagSkipHeaderRemoval, "skip-header-removal", false, "Skip Keep-Alive header removal scan")
+	scanCmd.Flags().BoolVar(&flagSkipPathCRLF, "skip-path-crlf", false, "Skip path CRLF injection scans (H1 and H2)")
 	scanCmd.Flags().BoolVar(&flagResearch, "research", false, "Enable research-mode H2 probes (HTTP2FakePseudo, HTTP2Scheme, HTTP2DualPath, HTTP2Method, HiddenHTTP2)")
+	scanCmd.Flags().BoolVarP(&flagExitOnFind, "exit", "x", false,
+		"Stop CL.TE/TE.CL scan after the first finding.\n"+
+			"  Default (without -x): test ALL techniques even after a finding.\n"+
+			"  Use -x for faster scans; omit for full technique coverage.")
+	scanCmd.Flags().BoolVarP(&flagCalibrate, "calibrate", "C", false,
+		"Auto-calibrate timing: send baseline requests to measure normal\n"+
+			"  response time, then detect delayed responses (not just hard timeouts).\n"+
+			"  Threshold = median baseline + 3s floor. Applies to ALL timing modules.")
+	scanCmd.Flags().BoolVar(&flagHTTP1, "http1", false,
+		"Scan HTTP/1.1 vulnerabilities only (CL.TE, TE.CL, CL.0, parser-discrepancy, etc.).\n"+
+			"  If the target does not respond to HTTP/1.1, these scans are skipped automatically.")
+	scanCmd.Flags().BoolVar(&flagHTTP2, "http2", false,
+		"Scan HTTP/2 vulnerabilities only (H2.TE, H2.CL, H2-tunnel, H2-research, etc.).\n"+
+			"  If the target does not negotiate HTTP/2 via ALPN, these scans are skipped automatically.\n"+
+			"  Default (neither --http1 nor --http2): both protocol scan sets are run.")
 	scanCmd.Flags().BoolVarP(&flagAll, "all", "a", false,
 		"Enable ALL modules including research probes.\n"+
 			"  Equivalent to: --research + all --skip-* disabled + -m POST,GET,HEAD\n"+
 			"  Individual flags can still override: --all --skip-h2 disables H2 on top of --all.")
 	scanCmd.Flags().StringSliceVar(&flagTechniques, "techniques", nil, "Comma-separated technique names to run (default: all). See 'techniques' subcommand.")
+	scanCmd.Flags().StringSliceVar(&flagModules, "modules", nil,
+		"Comma-separated module names to run (default: all). When set, --skip-* flags are ignored.\n"+
+			"  Modules: clte, tecl, cl0, chunksizes, parser, client-desync, conn-state,\n"+
+			"  pause, implicit-zero, h1-tunnel, header-removal, h2, h2-tunnel, h2-research.")
+	scanCmd.Flags().StringArrayVarP(&flagHeaders, "header", "H", nil,
+		"Add a custom header to all requests (repeatable). Format: \"Name: Value\".\n"+
+			"  Examples: -H \"Authorization: Bearer token\" -H \"Cookie: session=abc\".\n"+
+			"  Cookie headers are merged with auto-captured session cookies.")
+	scanCmd.Flags().IntVar(&flagAttempts, "attempts", 5,
+		"Number of attack+probe cycles for pipeline-poisoning modules (CL.0, H2.CL0,\n"+
+			"  H2.CL smuggle, H2.CL inject). Higher values improve detection on targets\n"+
+			"  with large connection pools but send more requests. Default: 5.")
+	scanCmd.Flags().StringVar(&flagCanaryPath, "canary-path", "",
+		"URL path for smuggled canary requests (default: "+config.DefaultCanaryPath+").\n"+
+			"  Used by H2.CL, CL.0, and other poison-detection probes.\n"+
+			"  Useful when WAF or routing filters the default path.")
 
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(versionCmd)
@@ -179,34 +229,30 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	// --all: enable every module and method set; individual --skip-* flags
 	// applied afterwards can still narrow the scope.
-	methods         := flagMethods
-	skipH2          := flagSkipH2
-	skipParser      := flagSkipParser
+	methods          := flagMethods
+	skipCLTE         := flagSkipCLTE
+	skipTECL         := flagSkipTECL
+	skipH2           := flagSkipH2
+	skipParser       := flagSkipParser
 	skipClientDesync := flagSkipClientDesync
-	skipPause       := flagSkipPause
-	skipImplicit    := flagSkipImplicit
-	skipConnState   := flagSkipConnState
-	skipCL0         := flagSkipCL0
-	skipChunkSizes  := flagSkipChunkSizes
-	skipH1Tunnel    := flagSkipH1Tunnel
-	skipH2Tunnel    := flagSkipH2Tunnel
+	skipPause        := flagSkipPause
+	skipImplicit     := flagSkipImplicit
+	skipConnState    := flagSkipConnState
+	skipCL0          := flagSkipCL0
+	skipChunkSizes   := flagSkipChunkSizes
+	skipH1Tunnel     := flagSkipH1Tunnel
+	skipH2Tunnel     := flagSkipH2Tunnel
 	skipHeaderRemoval := flagSkipHeaderRemoval
-	researchMode    := flagResearch
+	skipPathCRLF     := flagSkipPathCRLF
+	researchMode     := flagResearch
 
 	if flagAll {
-		// Enable everything by default; explicit --skip-* flags still take effect
 		if len(methods) == 0 {
 			methods = []string{"POST", "GET", "HEAD"}
 		}
 		researchMode = true
-		// Only override skip flags if user did NOT explicitly set them
-		// Cobra doesn't expose whether a flag was explicitly set, so we use
-		// a simple convention: --all sets all to false unless user passed
-		// the corresponding --skip-X flag explicitly (which would override
-		// the default false). Since cobra defaults are false, if the flag is
-		// still false after parsing it means user didn't set it — which means
-		// --all correctly leaves them as false (= enabled).
-		// No extra work needed; skip flags default to false = don't skip.
+		_ = skipCLTE
+		_ = skipTECL
 		_ = skipH2
 		_ = skipParser
 		_ = skipClientDesync
@@ -218,6 +264,15 @@ func runScan(_ *cobra.Command, args []string) error {
 		_ = skipH1Tunnel
 		_ = skipH2Tunnel
 		_ = skipHeaderRemoval
+		_ = skipPathCRLF
+	}
+
+	// Debug logging callback — prints to stderr so it doesn't interfere with JSON output
+	var debugLog func(string, ...any)
+	if flagDebug >= 1 {
+		debugLog = func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "[DEBUG] "+format+"\n", args...)
+		}
 	}
 
 	cfg := config.Config{
@@ -225,10 +280,16 @@ func runScan(_ *cobra.Command, args []string) error {
 		Proxy:             flagProxy,
 		SkipTLSVerify:     flagSkipTLS,
 		Verbose:           flagVerbose,
+		Debug:             flagDebug,
+		DebugLog:          debugLog,
 		Workers:           flagWorkers,
 		ConfirmReps:       flagConfirm,
 		Methods:           methods,
 		ForceMethod:       flagForceMethod,
+		ScanHTTP1:         flagHTTP1,
+		ScanHTTP2:         flagHTTP2,
+		SkipCLTE:          skipCLTE,
+		SkipTECL:          skipTECL,
 		SkipH2:            skipH2,
 		SkipParser:        skipParser,
 		SkipClientDesync:  skipClientDesync,
@@ -240,8 +301,16 @@ func runScan(_ *cobra.Command, args []string) error {
 		SkipH1Tunnel:      skipH1Tunnel,
 		SkipH2Tunnel:      skipH2Tunnel || skipH2,
 		SkipHeaderRemoval: skipHeaderRemoval,
+		SkipPathCRLF:      skipPathCRLF,
+		ExtraHeaders:      flagHeaders,
+		Modules:           flagModules,
 		ResearchMode:      researchMode,
+		ExitOnFind:        flagExitOnFind,
+		Calibrate:         flagCalibrate,
+		CalibrationFloor:  config.DefaultCalibrationFloor,
 		TechniquesFilter:  flagTechniques,
+		CanaryPath:        flagCanaryPath,
+		Attempts:          flagAttempts,
 	}
 
 	ch := make(chan string, len(targets))

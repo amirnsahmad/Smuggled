@@ -25,6 +25,7 @@ import (
 // ScanClientDesync probes for browser-powered / client-side desync.
 func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("ClientDesync probe: %s", target.Host)
+	dbg(cfg, "ClientDesync: starting, target=%s", target.Host)
 
 	host := target.Hostname()
 	if p := target.Port(); p != "" {
@@ -70,19 +71,18 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 
 	// Read response to the POST — if server accepted keep-alive we should get one
 	r1, elapsed1, r1TimedOut := conn.RecvWithTimeout(cfg.Timeout)
+	st1 := request.StatusCode(r1)
+	dbg(cfg, "ClientDesync: r1 status=%d len=%d elapsed=%v timeout=%v", st1, len(r1), elapsed1, r1TimedOut)
 	if r1TimedOut || len(r1) == 0 {
 		rep.Log("ClientDesync: no response to probe (elapsed=%v)", elapsed1)
 		return
 	}
-
-	st1 := request.StatusCode(r1)
 	if st1 == 0 {
 		return
 	}
-
-	// Check if connection is still alive (server sent keep-alive)
 	if request.ContainsStr(r1, "connection: close") {
 		rep.Log("ClientDesync: server closed connection, not vulnerable")
+		dbg(cfg, "ClientDesync: conn closed by server")
 		return
 	}
 
@@ -97,23 +97,25 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 		shortTimeout = cfg.Timeout / 2
 	}
 	r2, elapsed2, r2TimedOut := conn.RecvWithTimeout(shortTimeout)
-	_ = elapsed2
+	dbg(cfg, "ClientDesync: r2 status=%d len=%d elapsed=%v timeout=%v",
+		request.StatusCode(r2), len(r2), elapsed2, r2TimedOut)
 
+	// Real desync signal: r2 timed out or never arrived.
+	//
+	// With CL=len(followup) + Content-length: 0 (bypass), a vulnerable back-end
+	// picks CL=large and treats the follow-up GET as the POST body. It consumes
+	// those bytes and never sends a second response on this connection — r2 hangs.
+	//
+	// If both r1 AND r2 arrive quickly, the server processed them as two separate
+	// requests (it picked CL=0), which is normal HTTP behaviour — not a desync.
 	if r2TimedOut || len(r2) == 0 {
-		// Server is waiting for more bytes from the POST body — possible desync
-		// Confirm with a normal request to see if server is still healthy
-		rep.Log("ClientDesync: follow-up timed out — potential CSD signal")
-		return
-	}
-
-	st2 := request.StatusCode(r2)
-
-	// Two valid responses on a single connection where the second came back fast
-	// is the key indicator of client-side desync.
-	if st1 > 0 && st2 > 0 {
-		desc := fmt.Sprintf("Got two responses (%d, %d) on a single connection in %.0fms — "+
-			"server may be treating next request body as a new request (client-side desync)",
-			st1, st2, float64(elapsed1.Milliseconds()))
+		desc := fmt.Sprintf(
+			"Follow-up request on the same keep-alive connection timed out after "+
+				"POST response (r1_status=%d, r1_elapsed=%v). "+
+				"The server may have consumed the follow-up request as the POST body "+
+				"(client-side desync: back-end reads Content-Length=%d while front-end "+
+				"accepted Content-length: 0).",
+			st1, elapsed1, len(followup))
 
 		rep.Emit(report.Finding{
 			Target:      target.String(),
@@ -122,7 +124,7 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 			Type:        "client-desync",
 			Technique:   "CL-body-smuggle",
 			Description: desc,
-			Evidence:    fmt.Sprintf("r1_status=%d r2_status=%d elapsed=%v", st1, st2, elapsed1),
+			Evidence:    fmt.Sprintf("r1_status=%d r2_elapsed=%v r2_timeout=true", st1, elapsed2),
 			RawProbe:    request.Truncate(string(probeBytes)+"\n---followup---\n"+string(followupBytes), 768),
 		})
 	}
