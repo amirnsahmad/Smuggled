@@ -4,6 +4,7 @@ package cmd
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -215,17 +216,19 @@ func runScan(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("no targets — use -u, -f, positional args, or pipe URLs via stdin")
 	}
 
-	out := os.Stdout
+	// findingsOut receives Emit output only (the file when -o is set, stdout otherwise).
+	// progress always goes to stdout so operator feedback never pollutes the findings file.
+	findingsOut := io.Writer(os.Stdout)
 	if flagOutput != "" {
 		f, err := os.Create(flagOutput)
 		if err != nil {
 			return fmt.Errorf("opening output file: %w", err)
 		}
 		defer f.Close()
-		out = f
+		findingsOut = f
 	}
 
-	rep := report.New(out, flagJSON, flagVerbose)
+	rep := report.New(findingsOut, os.Stdout, flagJSON, flagVerbose)
 
 	// --all: enable every module and method set; individual --skip-* flags
 	// applied afterwards can still narrow the scope.

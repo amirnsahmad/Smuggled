@@ -414,12 +414,18 @@ func extractHost(target string) string {
 // ─── Reporter ─────────────────────────────────────────────────────────────────
 
 // Reporter writes findings to an output writer.
+//
+// Two separate writers are maintained:
+//   - out:      receives findings only (Emit). When -o is set, this is the file.
+//   - progress: receives progress/log lines (Progress, Log). Always stdout so
+//               operator feedback is never mixed into the findings file.
 type Reporter struct {
-	mu      sync.Mutex
-	out     io.Writer
-	jsonFmt bool
-	verbose bool
-	found   bool // set to true on first Emit
+	mu       sync.Mutex
+	out      io.Writer // findings destination (file when -o, stdout otherwise)
+	progress io.Writer // progress/log destination (always stdout)
+	jsonFmt  bool
+	verbose  bool
+	found    bool // set to true on first Emit
 }
 
 // Found reports whether at least one finding has been emitted.
@@ -430,8 +436,13 @@ func (r *Reporter) Found() bool {
 }
 
 // New creates a new Reporter.
-func New(out io.Writer, jsonFormat, verbose bool) *Reporter {
-	return &Reporter{out: out, jsonFmt: jsonFormat, verbose: verbose}
+//
+// out      — where findings (Emit) are written; the file when -o is used.
+// progress — where progress/log lines go; callers should pass os.Stdout so
+//
+//	operator feedback never ends up in the findings file.
+func New(out, progress io.Writer, jsonFormat, verbose bool) *Reporter {
+	return &Reporter{out: out, progress: progress, jsonFmt: jsonFormat, verbose: verbose}
 }
 
 // Emit records and prints a finding immediately.
@@ -472,14 +483,14 @@ func (r *Reporter) Log(format string, args ...any) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	fmt.Fprintf(r.out, "\033[2m[DBG] "+format+"\033[0m\n", args...)
+	fmt.Fprintf(r.progress, "\033[2m[DBG] "+format+"\033[0m\n", args...)
 }
 
 // Progress prints a progress line unconditionally.
 func (r *Reporter) Progress(format string, args ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	fmt.Fprintf(r.out, "[*] "+format+"\n", args...)
+	fmt.Fprintf(r.progress, "[*] "+format+"\n", args...)
 }
 
 func colorForSeverity(s Severity) string {
