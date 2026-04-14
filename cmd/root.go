@@ -4,6 +4,7 @@ package cmd
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -142,9 +143,9 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagSkipPathCRLF, "skip-path-crlf", false, "Skip path CRLF injection scans (H1 and H2)")
 	scanCmd.Flags().BoolVar(&flagResearch, "research", false, "Enable research-mode H2 probes (HTTP2FakePseudo, HTTP2Scheme, HTTP2DualPath, HTTP2Method, HiddenHTTP2)")
 	scanCmd.Flags().BoolVarP(&flagExitOnFind, "exit", "x", false,
-		"Stop CL.TE/TE.CL scan after the first finding.\n"+
-			"  Default (without -x): test ALL techniques even after a finding.\n"+
-			"  Use -x for faster scans; omit for full technique coverage.")
+		"After the first finding in a module, skip remaining techniques in that module\n"+
+			"  and move on to the next module. All modules still run.\n"+
+			"  Default (without -x): test ALL techniques in ALL modules regardless of findings.")
 	scanCmd.Flags().BoolVarP(&flagCalibrate, "calibrate", "C", false,
 		"Auto-calibrate timing: send baseline requests to measure normal\n"+
 			"  response time, then detect delayed responses (not just hard timeouts).\n"+
@@ -215,17 +216,19 @@ func runScan(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("no targets — use -u, -f, positional args, or pipe URLs via stdin")
 	}
 
-	out := os.Stdout
+	// findingsOut receives Emit output only (the file when -o is set, stdout otherwise).
+	// progress always goes to stdout so operator feedback never pollutes the findings file.
+	findingsOut := io.Writer(os.Stdout)
 	if flagOutput != "" {
 		f, err := os.Create(flagOutput)
 		if err != nil {
 			return fmt.Errorf("opening output file: %w", err)
 		}
 		defer f.Close()
-		out = f
+		findingsOut = f
 	}
 
-	rep := report.New(out, flagJSON, flagVerbose)
+	rep := report.New(findingsOut, os.Stdout, flagJSON, flagVerbose)
 
 	// --all: enable every module and method set; individual --skip-* flags
 	// applied afterwards can still narrow the scope.

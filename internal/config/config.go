@@ -77,10 +77,10 @@ type Config struct {
 	// TechniquesFilter: if non-empty only run techniques whose Name is in this list.
 	TechniquesFilter []string
 
-	// ExitOnFind: when true, CL.TE and TE.CL scanners stop after the first
-	// finding (original behaviour). When false (default), they continue
-	// testing ALL techniques even after a finding, which is useful for
-	// debugging and full coverage assessment.
+	// ExitOnFind: when true, each module stops testing further techniques after
+	// its first finding and moves on to the next module. When false (default),
+	// every technique in every module is tested regardless of findings — useful
+	// for full coverage assessment.
 	ExitOnFind bool
 
 	// Calibrate: when true, the scanner sends baseline requests before
