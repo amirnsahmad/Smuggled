@@ -143,9 +143,9 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagSkipPathCRLF, "skip-path-crlf", false, "Skip path CRLF injection scans (H1 and H2)")
 	scanCmd.Flags().BoolVar(&flagResearch, "research", false, "Enable research-mode H2 probes (HTTP2FakePseudo, HTTP2Scheme, HTTP2DualPath, HTTP2Method, HiddenHTTP2)")
 	scanCmd.Flags().BoolVarP(&flagExitOnFind, "exit", "x", false,
-		"Stop CL.TE/TE.CL scan after the first finding.\n"+
-			"  Default (without -x): test ALL techniques even after a finding.\n"+
-			"  Use -x for faster scans; omit for full technique coverage.")
+		"After the first finding in a module, skip remaining techniques in that module\n"+
+			"  and move on to the next module. All modules still run.\n"+
+			"  Default (without -x): test ALL techniques in ALL modules regardless of findings.")
 	scanCmd.Flags().BoolVarP(&flagCalibrate, "calibrate", "C", false,
 		"Auto-calibrate timing: send baseline requests to measure normal\n"+
 			"  response time, then detect delayed responses (not just hard timeouts).\n"+

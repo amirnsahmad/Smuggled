@@ -111,16 +111,12 @@ func (s *Scanner) Scan(rawURL string) {
 // runModules fires every enabled detection module in a defined order.
 // runH1 / runH2 reflect protocol availability + user intent; each module
 // is only executed when its target protocol is available.
-// When cfg.ExitOnFind is true, execution stops after the first module that
-// emits a finding — no subsequent modules are called.
+// When cfg.ExitOnFind is true, each module stops internally after its first
+// finding but all remaining modules still run (skip within, not across).
 func (s *Scanner) runModules(u *url.URL, base []byte, cfg config.Config, runH1, runH2 bool) {
 	rep := s.rep
 	dbg(cfg, "runModules: h1=%v h2=%v skipH2=%v skipParser=%v skipCL0=%v skipChunk=%v skipClient=%v skipConn=%v skipPause=%v skipImplicit=%v skipH1Tunnel=%v skipH2Tunnel=%v skipHeader=%v research=%v",
 		runH1, runH2, cfg.SkipH2, cfg.SkipParser, cfg.SkipCL0, cfg.SkipChunkSizes, cfg.SkipClientDesync, cfg.SkipConnState, cfg.SkipPause, cfg.SkipImplicitZero, cfg.SkipH1Tunnel, cfg.SkipH2Tunnel, cfg.SkipHeaderRemoval, cfg.ResearchMode)
-
-	// done returns true when ExitOnFind is set and a finding has been emitted,
-	// signalling that no further modules should run.
-	done := func() bool { return cfg.ExitOnFind && rep.Found() }
 
 	if runH1 || runH2 {
 		if cfg.ModuleEnabled("path-crlf", cfg.SkipPathCRLF) {
@@ -129,64 +125,56 @@ func (s *Scanner) runModules(u *url.URL, base []byte, cfg config.Config, runH1, 
 	}
 
 	if runH1 {
-		if !done() && cfg.ModuleEnabled("clte", cfg.SkipCLTE) {
+		if cfg.ModuleEnabled("clte", cfg.SkipCLTE) {
 			ScanCLTE(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("tecl", cfg.SkipTECL) {
+		if cfg.ModuleEnabled("tecl", cfg.SkipTECL) {
 			ScanTECL(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("cl0", cfg.SkipCL0) {
+		if cfg.ModuleEnabled("cl0", cfg.SkipCL0) {
 			ScanCL0(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("chunksizes", cfg.SkipChunkSizes) {
+		if cfg.ModuleEnabled("chunksizes", cfg.SkipChunkSizes) {
 			ScanChunkSizes(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("parser", cfg.SkipParser) {
+		if cfg.ModuleEnabled("parser", cfg.SkipParser) {
 			ScanParserDiscrepancy(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("client-desync", cfg.SkipClientDesync) {
+		if cfg.ModuleEnabled("client-desync", cfg.SkipClientDesync) {
 			ScanClientDesync(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("conn-state", cfg.SkipConnState) {
+		if cfg.ModuleEnabled("conn-state", cfg.SkipConnState) {
 			ScanConnectionState(u, base, cfg, rep)
-			if !done() {
-				ScanConnectionStateReflect(u, base, cfg, rep)
-			}
+			ScanConnectionStateReflect(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("pause", cfg.SkipPause) {
+		if cfg.ModuleEnabled("pause", cfg.SkipPause) {
 			ScanPauseDesync(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("implicit-zero", cfg.SkipImplicitZero) {
+		if cfg.ModuleEnabled("implicit-zero", cfg.SkipImplicitZero) {
 			ScanImplicitZero(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("h1-tunnel", cfg.SkipH1Tunnel) {
+		if cfg.ModuleEnabled("h1-tunnel", cfg.SkipH1Tunnel) {
 			ScanH1Tunnel(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("header-removal", cfg.SkipHeaderRemoval) {
+		if cfg.ModuleEnabled("header-removal", cfg.SkipHeaderRemoval) {
 			ScanHeaderRemoval(u, base, cfg, rep)
 		}
 	}
 
 	if runH2 {
-		if !done() && cfg.ModuleEnabled("h2", cfg.SkipH2) {
+		if cfg.ModuleEnabled("h2", cfg.SkipH2) {
 			ScanH2Downgrade(u, base, cfg, rep)
-			if !done() {
-				ScanH2CLInject(u, base, cfg, rep)
-			}
+			ScanH2CLInject(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("cl0", cfg.SkipCL0) {
+		if cfg.ModuleEnabled("cl0", cfg.SkipCL0) {
 			ScanH2CL0(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("h2-tunnel", cfg.SkipH2Tunnel) {
+		if cfg.ModuleEnabled("h2-tunnel", cfg.SkipH2Tunnel) {
 			ScanH2Tunnel(u, base, cfg, rep)
-			if !done() {
-				ScanH2TunnelCL(u, base, cfg, rep)
-			}
-			if !done() {
-				ScanHeadScanTE(u, base, cfg, rep)
-			}
+			ScanH2TunnelCL(u, base, cfg, rep)
+			ScanHeadScanTE(u, base, cfg, rep)
 		}
-		if !done() && cfg.ModuleEnabled("h2-research", !cfg.ResearchMode) {
+		if cfg.ModuleEnabled("h2-research", !cfg.ResearchMode) {
 			ScanH2Research(u, base, cfg, rep)
 		}
 	}
