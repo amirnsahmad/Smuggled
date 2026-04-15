@@ -300,15 +300,25 @@ func countOccurrences(haystack, needle []byte) int {
 
 // ScanPauseDesync tests for pause-based desync (mid-request TCP pause).
 //
-// Mirrors PauseDesyncScan.java:
-//  1. Build a POST where the body contains a smuggled GET to a poison path
-//     (e.g. /favicon.ico?<poisonCanary>=1). The Content-Length covers the body.
-//  2. Send headers + pause mid-body. A vulnerable front-end flushes/forwards after
-//     the pause — the back-end sees the body as a new request (poison request).
-//  3. Immediately send a normal follow-up GET to the original path.
-//  4. If the follow-up response contains the poison canary or the poison-path content
-//     (e.g. "image/"), the poison request leaked into the follow-up → confirmed.
-//  5. Title follows Java: reflect / expected-response / status variants.
+// Mirrors PauseDesyncScan.java (waitScan / pauseScan logic).
+//
+// Mechanism (Varnish synth, Apache Redirect, etc.):
+//   Some servers respond to a partial HTTP request after their own request-timeout
+//   fires, but leave the TCP connection open for reuse even though they only read the
+//   headers off the socket. When the client then sends the body, the server treats
+//   those bytes as the start of the next request — a pause-based desync.
+//
+// Detection flow:
+//  1. Baseline: normal GET → record status for comparison.
+//  2. Send only the POST headers (CL = len(smuggledBody)) — NO body yet.
+//  3. Wait silently for up to (cfg.Timeout - margin). If the server responds
+//     BEFORE we send any body, its own request-timeout fired → primary signal.
+//     If the server does NOT respond before our timeout → not vulnerable (or our
+//     timeout is too low; raise --timeout above the server's request-timeout).
+//  4. Confirm: send the smuggled body bytes on the same connection. If the server
+//     already left the connection half-open, these bytes are parsed as a new request.
+//  5. Read r1 (response to the "new request") and check for poison signals:
+//     reflect / expected-response / status-change — mirrors Java title logic.
 func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("PauseDesync probe: %s", target.Host)
 	dbg(cfg, "PauseDesync: starting, target=%s", target.Host)
@@ -322,19 +332,33 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 		path = "/"
 	}
 
-	pauseDuration := 6 * time.Second
-	if cfg.Timeout < pauseDuration+2*time.Second {
-		return // need headroom above the pause duration
+	// pauseWait: how long we wait for the server to respond before we send any body.
+	// Must be < cfg.Timeout so we still have budget left to send the body and read r1.
+	// Detection only works when cfg.Timeout > server's request-timeout.
+	const pauseMargin = 2 * time.Second
+	pauseWait := cfg.Timeout - pauseMargin
+	if pauseWait <= 0 {
+		rep.Log("PauseDesync: cfg.Timeout (%v) too low to leave pause headroom; skipping", cfg.Timeout)
+		return
 	}
 
+	// Canary path — a URL that should produce a distinctive response (e.g. 404)
+	// so we can recognise if the server processed our smuggled body as a new request.
 	poisonCanary := generateCanary()
-	poisonPath := "/favicon.ico?" + poisonCanary + "=1"
-	// The smuggled body is a partial GET that the back-end would parse as a new req
-	// "GET /favicon.ico?<canary>=1 HTTP/1.1\r\nX: Y" — X: Y is an incomplete header
-	// so the back-end will wait for more, then time out / return 400.
-	smuggledBody := fmt.Sprintf("GET %s HTTP/1.1\r\nX: Y", poisonPath)
+	poisonPath := config.EffectiveCanaryPath(cfg)
+	if poisonPath == "/" {
+		poisonPath = "/favicon.ico?" + poisonCanary + "=1"
+	}
 
-	// Base POST: CL = len(smuggledBody), body = smuggledBody
+	// The smuggled body: a complete GET to the canary path.
+	// Sent on a connection whose headers were already processed → server parses
+	// this as the next independent HTTP/1.1 request.
+	smuggledBody := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+		poisonPath, host)
+
+	// Headers-only POST: CL = len(smuggledBody), NO body sent initially.
+	// keep-alive so the connection stays open after the server's timeout response.
 	headers := fmt.Sprintf(
 		"POST %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+
@@ -345,30 +369,28 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 			"\r\n",
 		path, host, len(smuggledBody))
 
-	// Follow-up request sent after the pause to detect poison bleeding in
-	followup := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
-
-	// Baseline: send follow-up directly to see its normal response
+	// Baseline: direct GET to the original path — records the normal status code.
+	normalGET := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
 	connBaseline, err := transport.Dial(target, cfg.Timeout, cfg.Proxy, cfg.SkipTLSVerify)
 	if err != nil {
-		rep.Log("PauseDesync: dial error: %v", err)
+		rep.Log("PauseDesync: baseline dial error: %v", err)
 		return
 	}
-	connBaseline.Send([]byte(followup)) //nolint:errcheck
+	connBaseline.Send([]byte(normalGET)) //nolint:errcheck
 	rBaseline, _, _ := connBaseline.RecvWithTimeout(cfg.Timeout)
 	connBaseline.Close()
 	if len(rBaseline) == 0 {
 		return
 	}
 	baselineStatus := request.StatusCode(rBaseline)
+	dbg(cfg, "PauseDesync: baseline status=%d", baselineStatus)
 
-	// Check that a poison-path canary is not already present in baseline (sanity)
-	poisonExpect := []byte("ype: image/") // partial "Content-Type: image/" — matches favicon
-	if request.ContainsStr(rBaseline, poisonCanary) || strings.Contains(string(rBaseline), string(poisonExpect)) {
-		return // baseline already contains signals — can't distinguish
+	// Sanity: baseline must not already reflect the canary (would be a false positive)
+	if request.ContainsStr(rBaseline, poisonCanary) {
+		return
 	}
 
-	// Open a keep-alive connection, send headers, pause, then send body
+	// ── Step 2: send headers only, then wait for early server response ────────
 	conn, err := transport.Dial(target, cfg.Timeout, cfg.Proxy, cfg.SkipTLSVerify)
 	if err != nil {
 		return
@@ -379,55 +401,89 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 		return
 	}
 
-	// Pause before sending body
-	time.Sleep(pauseDuration)
+	// PRIMARY GATE: wait up to pauseWait for server to respond WITHOUT us sending body.
+	// If the server's request-timeout fires, it sends a response and (on vulnerable
+	// servers) leaves the connection open with the socket buffer at "start of new req".
+	// If we time out here (earlyTimedOut=true), the server is still waiting for the
+	// body → not vulnerable with current cfg.Timeout setting → bail out.
+	earlyResp, earlyElapsed, earlyTimedOut := conn.RecvWithTimeout(pauseWait)
 
-	// Check if the server already responded (some do if Connection: close is in effect)
-	earlyResp, _, earlyTimeout := conn.RecvWithTimeout(500 * time.Millisecond)
-	if !earlyTimeout && len(earlyResp) > 0 {
-		if request.ContainsStr(earlyResp, "connection: close") {
-			// Server closed after timeout — won't accept the follow-up
-			rep.Log("PauseDesync: server closed on pause, skipping")
-			return
-		}
+	dbg(cfg, "PauseDesync: pause wait=%v elapsed=%v timedOut=%v earlyStatus=%d earlyLen=%d",
+		pauseWait, earlyElapsed, earlyTimedOut, request.StatusCode(earlyResp), len(earlyResp))
+
+	if earlyTimedOut || len(earlyResp) == 0 {
+		// Server did not respond before we sent any body — it is still waiting.
+		// Raise --timeout above the server's request-timeout to detect this.
+		rep.Log("PauseDesync: no early response after %v — server still waiting for body "+
+			"(raise --timeout > server request-timeout to detect)", pauseWait)
+		return
 	}
 
-	// Send the smuggled body
+	earlyStatus := request.StatusCode(earlyResp)
+	dbg(cfg, "PauseDesync: *** EARLY RESPONSE in %v (status=%d) — server's timeout fired! ***",
+		earlyElapsed.Round(time.Millisecond), earlyStatus)
+
+	// If the server explicitly closed the connection we can't reuse it for body injection.
+	if request.ContainsStr(earlyResp, "connection: close") {
+		// Emit a lower-confidence finding: server timed out but closed the connection.
+		// A browser-based attacker could still race the connection close, but we can't
+		// confirm the body-as-new-request on this connection.
+		rep.Emit(report.Finding{
+			Target:    target.String(),
+			Method:    config.EffectiveMethods(cfg)[0],
+			Severity:  report.SeverityInfo,
+			Type:      "pause-desync",
+			Technique: "pause-early-close",
+			Description: fmt.Sprintf(
+				"Pause-based desync (partial): server responded in %v to a POST with "+
+					"Content-Length: %d and no body (status=%d), but sent Connection: close. "+
+					"The server's request-timeout fired before receiving the body. "+
+					"A browser-powered attacker may be able to race the connection close window. "+
+					"Reference: https://portswigger.net/research/browser-powered-desync-attacks",
+				earlyElapsed.Round(time.Millisecond), len(smuggledBody), earlyStatus),
+			Evidence: fmt.Sprintf("early_elapsed=%v early_status=%d connection_close=true",
+				earlyElapsed.Round(time.Millisecond), earlyStatus),
+			RawProbe: request.Truncate(headers, 512),
+		})
+		return
+	}
+
+	// ── Step 4: send smuggled body — treated as new request on poisoned connection ─
 	if err := conn.Send([]byte(smuggledBody)); err != nil {
 		return
 	}
 
-	r1, _, r1TimedOut := conn.RecvWithTimeout(cfg.Timeout)
-	dbg(cfg, "PauseDesync: r1 status=%d len=%d timeout=%v", request.StatusCode(r1), len(r1), r1TimedOut)
-	if r1TimedOut || len(r1) == 0 {
-		return
+	// r1: response to the smuggled body parsed as a new HTTP request.
+	remainingTimeout := cfg.Timeout - earlyElapsed
+	if remainingTimeout < time.Second {
+		remainingTimeout = time.Second
 	}
-	if request.ContainsStr(r1, "connection: close") {
-		dbg(cfg, "PauseDesync: conn closed after r1")
-		return
-	}
+	r1, _, r1TimedOut := conn.RecvWithTimeout(remainingTimeout)
+	r1Status := request.StatusCode(r1)
+	dbg(cfg, "PauseDesync: r1 status=%d len=%d timeout=%v", r1Status, len(r1), r1TimedOut)
 
-	if err := conn.Send([]byte(followup)); err != nil {
-		return
-	}
-	r2, _, _ := conn.RecvWithTimeout(cfg.Timeout)
-	dbg(cfg, "PauseDesync: r2 status=%d len=%d", request.StatusCode(r2), len(r2))
-	if len(r2) == 0 {
-		return
-	}
-
-	// Determine which desync title applies (mirrors Java logic)
-	var title string
+	// Determine signal type (mirrors Java: reflect / expected-response / status)
+	poisonExpect := "image/" // favicon content-type signal
+	var technique, desc string
 	switch {
-	case request.ContainsStr(r2, poisonCanary):
-		title = "Pause-based desync - reflect"
-	case strings.Contains(string(r2), string(poisonExpect)):
-		title = "Pause-based desync - expected-response"
-	case request.StatusCode(r2) != baselineStatus &&
-		!request.ContainsStr(r2, poisonCanary):
-		title = "Pause-based desync - status"
+	case request.ContainsStr(r1, poisonCanary):
+		technique = "pause-reflect"
+		desc = fmt.Sprintf("Pause-based desync - reflect: canary '%s' found in response to smuggled body (treated as new request). ", poisonCanary)
+	case strings.Contains(strings.ToLower(string(r1)), poisonExpect):
+		technique = "pause-expected-response"
+		desc = "Pause-based desync - expected-response: favicon content-type detected in response to smuggled body (treated as new request). "
+	case r1Status > 0 && r1Status != baselineStatus:
+		technique = "pause-status"
+		desc = fmt.Sprintf("Pause-based desync - status: smuggled body produced status %d (baseline=%d). ", r1Status, baselineStatus)
+	case r1TimedOut || (len(r1) == 0 && !r1TimedOut):
+		// No response to the body-as-request — server may have processed it silently
+		// or the connection closed. Emit a lower-confidence finding.
+		technique = "pause-no-r1"
+		desc = "Pause-based desync: server responded to headers-only POST before body was sent (request-timeout), then produced no response to the body bytes (possible blind desync). "
 	default:
-		return // no signal
+		// r1 arrived but matches baseline — inconclusive
+		dbg(cfg, "PauseDesync: r1 matches baseline, no signal")
+		return
 	}
 
 	rep.Emit(report.Finding{
@@ -435,15 +491,14 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 		Method:    config.EffectiveMethods(cfg)[0],
 		Severity:  report.SeverityProbable,
 		Type:      "pause-desync",
-		Technique: "pause-body-smuggle",
-		Description: title + ": " +
-			"The website appears vulnerable to a pause-based desync. " +
-			"A POST request with a mid-body TCP pause caused the follow-up response " +
-			"to contain evidence of the smuggled request. " +
+		Technique: technique,
+		Description: desc +
+			"The server responded to a POST before the body was sent (its request-timeout fired), " +
+			"then treated the body bytes as a new request — classic pause-based desync. " +
 			"Reference: https://portswigger.net/research/browser-powered-desync-attacks",
 		Evidence: fmt.Sprintf(
-			"baseline_status=%d r1_status=%d r2_status=%d poison_canary=%s",
-			baselineStatus, request.StatusCode(r1), request.StatusCode(r2), poisonCanary),
-		RawProbe: request.Truncate(headers+smuggledBody+"\n---followup---\n"+followup, 768),
+			"early_elapsed=%v early_status=%d r1_status=%d baseline_status=%d canary=%s",
+			earlyElapsed.Round(time.Millisecond), earlyStatus, r1Status, baselineStatus, poisonCanary),
+		RawProbe: request.Truncate(headers+"\n--- (pause) ---\n"+smuggledBody, 768),
 	})
 }
