@@ -47,13 +47,15 @@ const pathCRLFInjectCL = 100 // injected Content-Length — large to guarantee t
 
 // pathCRLFVariant describes one path-injection payload.
 type pathCRLFVariant struct {
-	name   string
-	suffix string // appended to the base path (already URL-encoded)
+	name       string
+	suffix     string // appended to the base path (already URL-encoded)
+	canaryHost string // non-empty for variants that inject a Host header; checked via reflection
 }
 
 // buildPathCRLFVariants returns all variants for the given base path.
+// canaryHost is used in host-override variants (e.g. "example.com.x00.day").
 // crlf values: single = "%0d%0a", double = "%250d%250a"
-func buildPathCRLFVariants(basePath string) []pathCRLFVariant {
+func buildPathCRLFVariants(basePath, canaryHost string) []pathCRLFVariant {
 	cl := fmt.Sprintf("%d", pathCRLFInjectCL)
 
 	var out []pathCRLFVariant
@@ -82,13 +84,15 @@ func buildPathCRLFVariants(basePath string) []pathCRLFVariant {
 			suffix: "#%20HTTP%2f1%2e1" + crlf + "Content-Length:%20" + cl + crlf + crlf + "XX",
 		})
 
-		// D: hash + injected Host override (may affect routing / virtual hosting)
+		// D: hash + injected Host override — canaryHost lets reflection-based
+		// detection fire when the back-end returns the host in an error response.
 		out = append(out, pathCRLFVariant{
 			name: "hash-host-" + label,
 			suffix: "#%20HTTP%2f1%2e1" + crlf +
-				"Host:%20injected.invalid" + crlf +
+				"Host:%20" + canaryHost + crlf +
 				"Content-Length:%20" + cl + crlf +
 				"Foo:%20x",
+			canaryHost: canaryHost,
 		})
 
 	}
@@ -120,7 +124,8 @@ func ScanPathCRLFInject(target *url.URL, base []byte, cfg config.Config, rep *re
 	}
 
 	timeoutThreshold := time.Duration(float64(cfg.Timeout) * request.TimeoutRatio)
-	variants := buildPathCRLFVariants(path)
+	canaryHost := target.Hostname() + ".x00.day"
+	variants := buildPathCRLFVariants(path, canaryHost)
 
 	// ── H1 probes ────────────────────────────────────────────────────────────
 	rep.Log("PathCRLF: starting H1 probes on %s", host)
@@ -142,10 +147,38 @@ func ScanPathCRLFInject(target *url.URL, base []byte, cfg config.Config, rep *re
 		rep.Log("PathCRLF [%s]: probe target=%s", label, host)
 		dbg(cfg, "[%s]: path=%s", label, injectedPath)
 
-		_, elapsed, timedOut, err := request.RawRequest(target, rawReq, cfg)
+		respBody, elapsed, timedOut, err := request.RawRequest(target, rawReq, cfg)
 		delayed := cfg.IsDelayed(elapsed)
 
 		dbg(cfg, "[%s]: elapsed=%v timedOut=%v delayed=%v err=%v", label, elapsed, timedOut, delayed, err)
+
+		// ── Reflection detection (fast response) ─────────────────────────────
+		// For host-inject variants: if the server returns quickly with the canary
+		// host in the response body (e.g. error page reflects the bad Host),
+		// that confirms CRLF injection reached the back-end even without a timeout.
+		if err == nil && v.canaryHost != "" && !timedOut && !delayed &&
+			request.ContainsStr(respBody, v.canaryHost) {
+			rep.Emit(report.Finding{
+				Target:    target.String(),
+				Method:    config.EffectiveMethods(cfg)[0],
+				Severity:  report.SeverityConfirmed,
+				Type:      "path-crlf",
+				Technique: label,
+				Description: fmt.Sprintf(
+					"Path CRLF injection (H1): URL-encoded CRLF in path (%s encoding) injected "+
+						"'Host: %s' into the back-end H1 request. "+
+						"The injected host was reflected in the response, confirming "+
+						"the front-end proxy decoded and forwarded the CRLF verbatim.",
+					v.name, v.canaryHost),
+				Evidence:  fmt.Sprintf("canary_host=%s reflected=true elapsed=%v", v.canaryHost, elapsed),
+				RawProbe:  request.Truncate(string(rawReq), 512),
+			})
+			rep.Log("PathCRLF [!] H1/%s canary host reflected on %s", v.name, target.String())
+			if cfg.ExitOnFind {
+				return
+			}
+			continue
+		}
 
 		if err != nil || (!timedOut && !delayed) {
 			continue
@@ -217,6 +250,33 @@ func ScanPathCRLFInject(target *url.URL, base []byte, cfg config.Config, rep *re
 		timedOut := elapsed >= timeoutThreshold && (resp == nil || resp.Status == 0)
 
 		dbg(cfg, "[%s]: elapsed=%v timedOut=%v delayed=%v err=%v", label, elapsed, timedOut, delayed, err)
+
+		// ── Reflection detection (fast response) ─────────────────────────────
+		if err == nil && v.canaryHost != "" && resp != nil && resp.Status != 0 &&
+			!timedOut && !delayed && request.ContainsStr(resp.Body, v.canaryHost) {
+			rawProbe := fmt.Sprintf("GET %s HTTP/2\r\nHost: %s\r\n:path: %s\r\n\r\n",
+				path, h2host, injectedPath)
+			rep.Emit(report.Finding{
+				Target:    target.String(),
+				Method:    "HTTP/2",
+				Severity:  report.SeverityConfirmed,
+				Type:      "path-crlf",
+				Technique: label,
+				Description: fmt.Sprintf(
+					"Path CRLF injection (H2): URL-encoded CRLF in :path pseudo-header (%s encoding) "+
+						"injected 'Host: %s' into the downgraded H1 request. "+
+						"The injected host was reflected in the response, confirming "+
+						"the H2 front-end forwarded the :path value verbatim during H2→H1 downgrade.",
+					v.name, v.canaryHost),
+				Evidence:  fmt.Sprintf("canary_host=%s reflected=true elapsed=%v", v.canaryHost, elapsed),
+				RawProbe:  rawProbe,
+			})
+			rep.Log("PathCRLF [!] H2/%s canary host reflected on %s", v.name, target.String())
+			if cfg.ExitOnFind {
+				return
+			}
+			continue
+		}
 
 		if err != nil || (!timedOut && !delayed) {
 			continue

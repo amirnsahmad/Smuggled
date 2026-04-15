@@ -165,6 +165,7 @@ func (s *Scanner) runModules(u *url.URL, base []byte, cfg config.Config, runH1, 
 		if cfg.ModuleEnabled("h2", cfg.SkipH2) {
 			ScanH2Downgrade(u, base, cfg, rep)
 			ScanH2CLInject(u, base, cfg, rep)
+			ScanH2HeaderNameInject(u, base, cfg, rep)
 		}
 		if cfg.ModuleEnabled("cl0", cfg.SkipCL0) {
 			ScanH2CL0(u, base, cfg, rep)
