@@ -68,6 +68,7 @@ type VulnReport struct {
 	Remediation string     `json:"remediation"`
 	Requests    [][]string `json:"requests"`
 	// Extra fields specific to smuggling
+	URL       string `json:"url"`
 	Technique string `json:"technique"`
 	Timestamp string `json:"timestamp"`
 }
@@ -104,6 +105,7 @@ func toVulnReport(f Finding) VulnReport {
 		References:  meta.references,
 		Remediation: meta.remediation,
 		Requests:    requests,
+		URL:         f.Target,
 		Technique:   f.Technique,
 		Timestamp:   f.Time.UTC().Format(time.RFC3339),
 	}
