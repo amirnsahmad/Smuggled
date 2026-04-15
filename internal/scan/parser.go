@@ -37,30 +37,40 @@ type canaryHeader struct {
 	headerName  string
 	value       string
 	shouldBlock bool // front-end would block this if it sees it
+	noHost      bool // build base request without Host header (for Host injection tests)
 }
 
 // ScanParserDiscrepancy probes for header parsing discrepancies between front and back-end.
+//
+// For each (canary, technique) pair, four "hidden pair" variants are tested —
+// matching ParserDiscrepancyScan.java + HiddenPair.java:
+//
+//  1. z-prefix, direct:   technique applied to z-prefixed name (zontent-Length, zost)
+//  2. real, direct:       technique applied to real name (Content-Length, Host)
+//  3. z-prefix, indirect: z-prefixed header standalone + "dummy" header hidden via technique
+//  4. real, indirect:     real header standalone + "dummy" header hidden via technique
 func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	rep.Log("ParserDiscrepancy probe: %s", target.Host)
 	dbg(cfg, "Parser: starting, target=%s", target.Host)
 
 	// Strip to a clean base: only keep essential headers
 	clean := buildCleanRequest(base, target)
+	cleanNoHost := buildCleanRequestNoHost(base, target)
 
 	canaries := []canaryHeader{
-		{name: "Host-invalid", headerName: "Host", value: "foo/bar", shouldBlock: true},
+		// CL-valid: numeric value 5. Burp tests this in the standard (non-research)
+		// scan — it causes the back-end to wait for 5 bytes when CL.0 is in effect.
+		{name: "CL-valid", headerName: "Content-Length", value: "5", shouldBlock: true},
+		// CL-invalid: non-numeric value. Back-ends that parse this as CL=0 desync.
 		{name: "CL-invalid", headerName: "Content-Length", value: "Z", shouldBlock: true},
-		{name: "Host-valid-missing", headerName: "Host", value: target.Hostname(), shouldBlock: false},
-	}
-	// In research mode, also test CL-valid (Content-Length: 5) which can cause timeouts
-	// on vulnerable targets — matches ParserDiscrepancyScan.java research mode behaviour.
-	if cfg.ResearchMode {
-		canaries = append(canaries, canaryHeader{
-			name: "CL-valid", headerName: "Content-Length", value: "5", shouldBlock: true,
-		})
+		// Host-valid-missing: base request has NO Host header; hidden-only injection.
+		// Tests if back-end accepts a Host that the front-end never saw as a top-level header.
+		{name: "Host-valid-missing", headerName: "Host", value: target.Hostname(), shouldBlock: false, noHost: true},
+		// Host-invalid: base has a normal Host; we inject a SECOND invalid Host value.
+		{name: "Host-invalid", headerName: "Host", value: "foo/bar", shouldBlock: true},
 	}
 
-	hideTechs := []hideTechnique{hideSpace, hideTab, hideWrap, hideHop, hideLpad}
+	hideTechs := []hideTechnique{hideLpad, hideHop, hideWrap, hideTab, hideSpace}
 
 	// Baseline: clean request with no canary
 	baseResp, _, baseTimedOut, err := request.RawRequest(target, clean, cfg)
@@ -72,69 +82,88 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep 
 	dbg(cfg, "Parser: baseline status=%d", baseStatus)
 
 	for _, canary := range canaries {
+		canaryBase := clean
+		if canary.noHost {
+			canaryBase = cleanNoHost
+		}
+		zName := zPrefixHeader(canary.headerName)
+
 		for _, hide := range hideTechs {
-			probeReq := injectHiddenHeader(clean, canary.headerName, canary.value, hide)
-			if probeReq == nil {
-				continue
+			// Build all 4 hidden-pair variants for this (canary, technique) pair.
+			type pairVariant struct {
+				label string
+				req   []byte
+			}
+			variants := []pairVariant{
+				// 1. z-prefix, direct: hide technique applied to z-prefixed header name
+				{"z/" + string(hide), injectHiddenHeader(canaryBase, zName, canary.value, hide)},
+				// 2. real, direct: hide technique applied to real header name
+				{string(hide), injectHiddenHeader(canaryBase, canary.headerName, canary.value, hide)},
+				// 3. z-prefix, indirect: z-prefix header standalone + dummy hidden via technique
+				{"z-indirect/" + string(hide), injectHiddenIndirect(canaryBase, zName, canary.value, hide)},
+				// 4. real, indirect: real header standalone + dummy hidden via technique
+				{"indirect/" + string(hide), injectHiddenIndirect(canaryBase, canary.headerName, canary.value, hide)},
 			}
 
-			resp, _, timedOut, err := request.RawRequest(target, probeReq, cfg)
-			if err != nil || timedOut {
-				dbg(cfg, "Parser [%s/%s]: err/timeout", canary.name, hide)
-				continue
-			}
-
-			probeStatus := request.StatusCode(resp)
-			dbg(cfg, "Parser [%s/%s]: probe_status=%d base=%d", canary.name, hide, probeStatus, baseStatus)
-			interesting := false
-			desc := ""
-
-			if canary.shouldBlock {
-				// If the canary should be blocked by front-end but we got a 200-ish:
-				// back-end saw it (front-end didn't strip it) OR back-end tolerates it differently
-				if probeStatus != baseStatus {
-					interesting = true
-					desc = fmt.Sprintf("status changed %d→%d with hidden %s header (technique=%s); "+
-						"possible parser discrepancy allowing desync", baseStatus, probeStatus, canary.name, hide)
-				}
-			} else {
-				// If the canary should be forwarded: if back-end rejects it, discrepancy
-				if probeStatus >= 400 && baseStatus < 400 {
-					interesting = true
-					desc = fmt.Sprintf("status %d with %s (hidden via %s) suggests back-end rejects header front-end forwards",
-						probeStatus, canary.name, hide)
-				}
-			}
-
-			if interesting {
-				// Confirm consistency
-				confirmedCount := 0
-				for i := 0; i < cfg.ConfirmReps; i++ {
-					r2, _, t2, e2 := request.RawRequest(target, probeReq, cfg)
-					if e2 != nil || t2 {
-						continue
-					}
-					if request.StatusCode(r2) == probeStatus {
-						confirmedCount++
-					}
-				}
-				if confirmedCount == 0 {
-					rep.Log("ParserDiscrepancy: inconsistent result for %s/%s, skipping", canary.name, hide)
+			for _, v := range variants {
+				if v.req == nil {
 					continue
 				}
 
-				rep.Emit(report.Finding{
-					Target:      target.String(),
-					Method:      config.EffectiveMethods(cfg)[0],
-					Severity:    report.SeverityInfo,
-					Type:        "parser-discrepancy",
-					Technique:   string(hide) + "/" + canary.name,
-					Description: desc,
-					RawProbe:    request.Truncate(string(probeReq), 512),
-					RawResponse: request.Truncate(request.SanitizeResponse(resp), 256),
-				})
-				if cfg.ExitOnFind {
-					return
+				resp, _, timedOut, err := request.RawRequest(target, v.req, cfg)
+				if err != nil || timedOut {
+					dbg(cfg, "Parser [%s/%s/%s]: err/timeout", canary.name, v.label, hide)
+					continue
+				}
+
+				probeStatus := request.StatusCode(resp)
+				dbg(cfg, "Parser [%s/%s]: probe_status=%d base=%d", canary.name, v.label, probeStatus, baseStatus)
+				interesting := false
+				desc := ""
+
+				if canary.shouldBlock {
+					if probeStatus != baseStatus {
+						interesting = true
+						desc = fmt.Sprintf("status changed %d→%d with hidden %s header (technique=%s); "+
+							"possible parser discrepancy allowing desync", baseStatus, probeStatus, canary.name, v.label)
+					}
+				} else {
+					if probeStatus >= 400 && baseStatus < 400 {
+						interesting = true
+						desc = fmt.Sprintf("status %d with %s (hidden via %s) suggests back-end rejects header front-end forwards",
+							probeStatus, canary.name, v.label)
+					}
+				}
+
+				if interesting {
+					confirmedCount := 0
+					for i := 0; i < cfg.ConfirmReps; i++ {
+						r2, _, t2, e2 := request.RawRequest(target, v.req, cfg)
+						if e2 != nil || t2 {
+							continue
+						}
+						if request.StatusCode(r2) == probeStatus {
+							confirmedCount++
+						}
+					}
+					if confirmedCount == 0 {
+						rep.Log("ParserDiscrepancy: inconsistent result for %s/%s, skipping", canary.name, v.label)
+						continue
+					}
+
+					rep.Emit(report.Finding{
+						Target:      target.String(),
+						Method:      config.EffectiveMethods(cfg)[0],
+						Severity:    report.SeverityInfo,
+						Type:        "parser-discrepancy",
+						Technique:   v.label + "/" + canary.name,
+						Description: desc,
+						RawProbe:    request.Truncate(string(v.req), 512),
+						RawResponse: request.Truncate(request.SanitizeResponse(resp), 256),
+					})
+					if cfg.ExitOnFind {
+						return
+					}
 				}
 			}
 		}
@@ -201,6 +230,30 @@ func injectHiddenHeader(req []byte, headerName, headerValue string, technique hi
 	}
 }
 
+// zPrefixHeader replaces the first character of a header name with 'z'.
+// This mirrors HiddenPair.java's z-prefix obfuscation:
+//   Content-Length → zontent-Length
+//   Host           → zost
+func zPrefixHeader(name string) string {
+	if name == "" {
+		return "z"
+	}
+	return "z" + name[1:]
+}
+
+// injectHiddenIndirect injects the canary header as a plain standalone header,
+// then hides a "dummy" header with the same value using the given technique.
+// This matches HiddenPair.java's "indirect" pair variant:
+//   e.g. for hideSpace + Content-Length: Z →
+//     Content-Length: Z\r\n
+//     dummy : Z
+func injectHiddenIndirect(req []byte, headerName, headerValue string, technique hideTechnique) []byte {
+	// Add standalone canary header (unhidden)
+	r := appendHeaderBeforeSep(req, headerName+": "+headerValue)
+	// Add "dummy" header with same value, hidden via the technique
+	return injectHiddenHeader(r, "dummy", headerValue, technique)
+}
+
 // appendHeaderBeforeSep inserts a header line (without trailing \r\n) just before
 // the blank line (\r\n\r\n) that separates headers from the body.
 // It adds exactly one \r\n before the new line, producing well-formed HTTP.
@@ -237,5 +290,23 @@ func buildCleanRequest(base []byte, target *url.URL) []byte {
 	b.WriteString("Connection: close\r\n")
 	b.WriteString("\r\n")
 	_ = base // could extract Accept/Accept-Encoding from original but keep it minimal
+	return []byte(b.String())
+}
+
+// buildCleanRequestNoHost builds a minimal request without a Host header.
+// Used for "Host-valid-missing" canary tests where the Host header is
+// injected exclusively via the hiding technique (not at the normal position).
+func buildCleanRequestNoHost(base []byte, target *url.URL) []byte {
+	path := target.RequestURI()
+	if path == "" {
+		path = "/"
+	}
+	var b strings.Builder
+	b.WriteString("POST " + path + " HTTP/1.1\r\n")
+	// No Host header — the canary injection provides it via the hide technique
+	b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
+	b.WriteString("Content-Length: 0\r\n")
+	b.WriteString("\r\n")
+	_ = base
 	return []byte(b.String())
 }

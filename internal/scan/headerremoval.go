@@ -29,12 +29,11 @@ import (
 	"github.com/smuggled/smuggled/internal/report"
 )
 
-const headerRemovalCanary = "wrtzwrrrrr"
-
 // headerStripTarget defines one hop-by-hop stripping probe.
 type headerStripTarget struct {
 	strip   string // header name to list in Connection (gets stripped by proxy)
 	body    string // request body to send
+	canary  string // string to look for in the response (may appear if backend processes the body)
 	typeTag string // finding Type label
 	desc    string // human-readable description of the attack surface
 }
@@ -60,10 +59,16 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *rep
 		path = "/"
 	}
 
+	// canaryHost is used as the injected Host value so that if the back-end
+	// processes the injected header it will reflect a recognisable domain in
+	// error messages (e.g. "Invalid Host: example.com.x00.day").
+	canaryHost := target.Hostname() + ".x00.day"
+
 	stripTargets := []headerStripTarget{
 		{
 			strip:   "host",
-			body:    "Host: " + headerRemovalCanary,
+			body:    "Host: " + canaryHost,
+			canary:  canaryHost,
 			typeTag: "header-removal",
 			desc: "Proxy strips the Host header listed in Connection hop-by-hop, " +
 				"enabling Host header injection via the request body.",
@@ -74,7 +79,8 @@ func ScanHeaderRemoval(target *url.URL, base []byte, cfg config.Config, rep *rep
 			// request — a CL.0 desync variant triggered purely by header removal.
 			// Back-ends that return 411 or 400 signal anomalous behaviour worth confirming.
 			strip:   "content-length",
-			body:    "Host: " + headerRemovalCanary,
+			body:    "Host: " + canaryHost,
+			canary:  canaryHost,
 			typeTag: "header-removal-cl",
 			desc: "Proxy strips Content-Length listed in Connection hop-by-hop. " +
 				"Backend receives a POST with body but without CL or TE — may default to " +
@@ -104,11 +110,11 @@ func runHeaderStripProbe(target *url.URL, path, host string, st headerStripTarge
 	dbg(cfg, "HeaderRemoval[%s]: harmless_status=%d attack_status=%d canary_in_attack=%v canary_in_harmless=%v",
 		st.strip,
 		request.StatusCode(harmlessResp), request.StatusCode(attackResp),
-		request.ContainsStr(attackResp, headerRemovalCanary),
-		request.ContainsStr(harmlessResp, headerRemovalCanary))
+		request.ContainsStr(attackResp, st.canary),
+		request.ContainsStr(harmlessResp, st.canary))
 
 	if request.StatusCode(attackResp) == request.StatusCode(harmlessResp) &&
-		request.ContainsStr(attackResp, headerRemovalCanary) == request.ContainsStr(harmlessResp, headerRemovalCanary) {
+		request.ContainsStr(attackResp, st.canary) == request.ContainsStr(harmlessResp, st.canary) {
 		return
 	}
 
@@ -121,7 +127,7 @@ func runHeaderStripProbe(target *url.URL, path, host string, st headerStripTarge
 			continue
 		}
 		if request.StatusCode(ar) != request.StatusCode(hr) ||
-			request.ContainsStr(ar, headerRemovalCanary) != request.ContainsStr(hr, headerRemovalCanary) {
+			request.ContainsStr(ar, st.canary) != request.ContainsStr(hr, st.canary) {
 			diffCount++
 		}
 	}
@@ -133,7 +139,7 @@ func runHeaderStripProbe(target *url.URL, path, host string, st headerStripTarge
 	// Final out-of-order check to filter round-robin noise
 	finalAtk, _, _, _ := request.RawRequest(target, attack, cfg)
 	if request.StatusCode(finalAtk) == request.StatusCode(harmlessResp) &&
-		request.ContainsStr(finalAtk, headerRemovalCanary) == request.ContainsStr(harmlessResp, headerRemovalCanary) {
+		request.ContainsStr(finalAtk, st.canary) == request.ContainsStr(harmlessResp, st.canary) {
 		return
 	}
 
@@ -148,11 +154,11 @@ func runHeaderStripProbe(target *url.URL, path, host string, st headerStripTarge
 				"(canary-in-attack=%v canary-in-harmless=%v).",
 			st.desc,
 			request.StatusCode(attackResp), request.StatusCode(harmlessResp),
-			request.ContainsStr(attackResp, headerRemovalCanary),
-			request.ContainsStr(harmlessResp, headerRemovalCanary)),
+			request.ContainsStr(attackResp, st.canary),
+			request.ContainsStr(harmlessResp, st.canary)),
 		Evidence: fmt.Sprintf(
 			"strip=%s attack_status=%d harmless_status=%d canary=%s",
-			st.strip, request.StatusCode(attackResp), request.StatusCode(harmlessResp), headerRemovalCanary),
+			st.strip, request.StatusCode(attackResp), request.StatusCode(harmlessResp), st.canary),
 		RawProbe: request.Truncate(string(attack), 512),
 	})
 	rep.Log("HeaderRemoval [!] strip=%s confirmed on %s", st.strip, target.String())
