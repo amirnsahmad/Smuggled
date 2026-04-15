@@ -168,14 +168,19 @@ func ScanHeadScanTE(target *url.URL, base []byte, cfg config.Config, rep *report
 	}
 }
 
-// ScanH2TunnelCL probes for H2 tunnel desync via Content-Length + Via null-byte.
+// ScanH2TunnelCL probes for H2 tunnel desync via CL-confusing techniques.
 // Maps to H2TunnelScan.java.
 //
-// This is distinct from ScanH2Tunnel (body-based) and ScanHeadScanTE (TE-based):
-// it injects a null byte in the Via header to bypass request normalization, and
-// relies on the front-end forwarding the body as-is when no TE is present.
-// The null byte in Via confuses some proxies into treating the request as opaque,
-// tunnelling the body without inspection.
+// Two complementary techniques are tested:
+//
+//  1. Via null-byte: embeds a null byte in the Via header to force some proxies
+//     into opaque tunnel mode — they forward the body without inspection.
+//
+//  2. Fakecontentlength: strips the real content-length header and adds
+//     "Fakecontentlength: 0". Some proxies normalize this fake header into
+//     Content-Length: 0 on the downgraded H1 request, causing CL.0 desync:
+//     the body (FOO BAR AAH\r\n\r\n) is left in the back-end TCP buffer as
+//     the start of a new H1 request.
 func ScanH2TunnelCL(target *url.URL, base []byte, cfg config.Config, rep *report.Reporter) {
 	cfg = cfg.WithDebugScope("H2TunnelCL")
 	if target.Scheme != "https" {
@@ -192,38 +197,58 @@ func ScanH2TunnelCL(target *url.URL, base []byte, cfg config.Config, rep *report
 	}
 	host := target.Hostname()
 
-	// Via header with embedded null byte — forces some proxies into opaque tunnelling
-	extraHeaders := map[string]string{
-		"via": "x (comment\x00hmmm)",
+	type clPerm struct {
+		name  string
+		extra map[string]string
 	}
 
-	for _, method := range h2TunnelMethods {
-		for _, trigger := range []string{h2trigger, h2triggerShort} {
-			rep.Log("H2TunnelCL probe: method=%s trigger=%q target=%s", method, trigger, host)
+	perms := []clPerm{
+		// Via null-byte: forces opaque tunnel mode in some proxies.
+		{
+			name:  "via-null",
+			extra: map[string]string{"via": "x (comment\x00hmmm)"},
+		},
+		// Fakecontentlength: fake CL header with value 0, real CL suppressed.
+		// Matches H2TunnelScan.java — some proxies treat this fake header name
+		// as content-length, causing CL.0 on the downgraded H1 request.
+		{
+			name: "fakecontentlength",
+			extra: map[string]string{
+				"content-length":    "", // suppress real CL
+				"fakecontentlength": "0",
+			},
+		},
+	}
 
-			h2resp, err := h2RawRequest(target, method, path, host, trigger, extraHeaders, cfg)
-			if err != nil {
-				rep.Log("H2TunnelCL error: %v", err)
-				continue
-			}
+	for _, perm := range perms {
+		for _, method := range h2TunnelMethods {
+			for _, trigger := range []string{h2trigger, h2triggerShort} {
+				rep.Log("H2TunnelCL probe: perm=%s method=%s trigger=%q target=%s",
+					perm.name, method, trigger, host)
 
-			if mixedH2Response(h2resp) {
-				rep.Emit(report.Finding{
-					Target:   target.String(),
-					Method:   "HTTP/2",
-					Severity: report.SeverityConfirmed,
-					Type:     "H2-tunnel-CL",
-					Technique: fmt.Sprintf("H2-tunnel-CL/%s", method),
-					Description: fmt.Sprintf(
-						"H2 CL-based tunnel desync: an HTTP/1.x response was detected inside "+
-							"the H2 response body (method=%s). A null byte in the Via header "+
-							"caused the proxy to tunnel the request body to the back-end without "+
-							"stripping it, allowing injection of arbitrary HTTP/1.1 requests.",
-						method),
-					Evidence: fmt.Sprintf("trigger=%q via_null=true mixed_response=true", trigger),
-				})
-				if cfg.ExitOnFind {
-					return
+				h2resp, err := h2RawRequest(target, method, path, host, trigger, perm.extra, cfg)
+				if err != nil {
+					rep.Log("H2TunnelCL error: %v", err)
+					continue
+				}
+
+				if mixedH2Response(h2resp) {
+					rep.Emit(report.Finding{
+						Target:   target.String(),
+						Method:   "HTTP/2",
+						Severity: report.SeverityConfirmed,
+						Type:     "H2-tunnel-CL",
+						Technique: fmt.Sprintf("H2-tunnel-CL/%s/%s", perm.name, method),
+						Description: fmt.Sprintf(
+							"H2 CL-based tunnel desync: an HTTP/1.x response was detected inside "+
+								"the H2 response body (method=%s, technique=%s). The front-end "+
+								"forwarded the request body to the back-end without stripping it.",
+							method, perm.name),
+						Evidence: fmt.Sprintf("trigger=%q perm=%s mixed_response=true", trigger, perm.name),
+					})
+					if cfg.ExitOnFind {
+						return
+					}
 				}
 			}
 		}
