@@ -126,9 +126,9 @@ func metaForType(t string) typeMeta {
 	switch {
 	case t == "CL.TE":
 		return typeMeta{
-			template: "hrs-clte",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/web-security/request-smuggling",
 				"https://portswigger.net/research/http-desync-attacks-what-happened-next",
@@ -142,9 +142,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "TE.CL":
 		return typeMeta{
-			template: "hrs-tecl",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/web-security/request-smuggling/exploiting",
 				"https://portswigger.net/research/http-desync-attacks-what-happened-next",
@@ -157,9 +157,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "CL.0" || t == "CL.0-potential":
 		return typeMeta{
-			template: "hrs-cl0",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/browser-powered-desync-attacks",
 				"https://portswigger.net/research/http1-must-die",
@@ -172,9 +172,9 @@ func metaForType(t string) typeMeta {
 
 	case strings.HasPrefix(t, "H2.TE") || strings.HasPrefix(t, "H2.CL") || t == "H2-tunnel" || t == "H2.TE-tunnel":
 		return typeMeta{
-			template: "hrs-h2-downgrade",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http2",
 				"https://portswigger.net/web-security/request-smuggling/advanced/http2-exclusive-vectors",
@@ -189,9 +189,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "H2-fake-pseudo":
 		return typeMeta{
-			template: "hrs-h2-fake-pseudo",
+			template: "",
 			cwe:      "CWE-74",
-			owasp:    "A03:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http2",
 				"https://portswigger.net/web-security/request-smuggling/advanced/http2-exclusive-vectors",
@@ -205,9 +205,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "H2-scheme-reflection":
 		return typeMeta{
-			template: "hrs-h2-scheme-reflection",
+			template: "",
 			cwe:      "CWE-918",
-			owasp:    "A10:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http2",
 				"https://portswigger.net/web-security/ssrf",
@@ -220,9 +220,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "H2-dual-path":
 		return typeMeta{
-			template: "hrs-h2-dual-path",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http2",
 				"https://portswigger.net/web-security/request-smuggling/advanced/http2-exclusive-vectors",
@@ -235,9 +235,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "H2-method-reflection":
 		return typeMeta{
-			template: "hrs-h2-method-reflection",
+			template: "",
 			cwe:      "CWE-918",
-			owasp:    "A10:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http2",
 				"https://portswigger.net/web-security/ssrf",
@@ -250,9 +250,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "hidden-H2":
 		return typeMeta{
-			template: "hrs-hidden-h2",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http2",
 				"https://portswigger.net/web-security/request-smuggling/advanced",
@@ -266,9 +266,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "parser-discrepancy":
 		return typeMeta{
-			template: "hrs-parser-discrepancy",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http1-must-die",
 				"https://portswigger.net/web-security/request-smuggling/browser-powered",
@@ -281,9 +281,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "client-desync":
 		return typeMeta{
-			template: "hrs-client-desync",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/browser-powered-desync-attacks",
 				"https://portswigger.net/web-security/request-smuggling/browser-powered",
@@ -296,9 +296,9 @@ func metaForType(t string) typeMeta {
 
 	case strings.HasPrefix(t, "chunk-size-"):
 		return typeMeta{
-			template: "hrs-chunk-size",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://w4ke.info/2025/06/18/funky-chunks.html",
 				"https://portswigger.net/research/http1-must-die",
@@ -311,9 +311,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "H1-tunnel":
 		return typeMeta{
-			template: "hrs-h1-tunnel",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http1-must-die",
 				"https://portswigger.net/web-security/request-smuggling/advanced",
@@ -326,9 +326,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "pause-desync" || t == "connection-state":
 		return typeMeta{
-			template: "hrs-timing",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/http-desync-attacks-what-happened-next",
 				"https://cwe.mitre.org/data/definitions/444.html",
@@ -340,9 +340,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "header-removal":
 		return typeMeta{
-			template: "hrs-header-removal",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/web-security/request-smuggling",
 				"https://cwe.mitre.org/data/definitions/444.html",
@@ -353,9 +353,9 @@ func metaForType(t string) typeMeta {
 
 	case t == "implicit-zero-CL":
 		return typeMeta{
-			template: "hrs-implicit-zero",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/research/browser-powered-desync-attacks",
 				"https://cwe.mitre.org/data/definitions/444.html",
@@ -367,9 +367,9 @@ func metaForType(t string) typeMeta {
 
 	default:
 		return typeMeta{
-			template: "hrs-generic",
+			template: "",
 			cwe:      "CWE-444",
-			owasp:    "A07:2021",
+			owasp:    "https://owasp.org/Top10/2025/A06_2025-Insecure_Design",
 			references: []string{
 				"https://portswigger.net/web-security/request-smuggling",
 				"https://cwe.mitre.org/data/definitions/444.html",
