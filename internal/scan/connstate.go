@@ -123,8 +123,18 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 		return // no difference — not vulnerable
 	}
 
-	// Step 3: anti-noise check — send trigger to a different path via warmup+trigger
-	// If response is still different from direct, confirms it is state-driven not random
+	// Step 3: path-specificity noise check — mirrors Java statusScan():
+	// Send warmup + trigger-to-/.well-known/cake on a fresh keep-alive connection.
+	//
+	// Key logic (from ConnectionStateScan.java lines 187-195):
+	//   if indirect404code == indirectCode → return null (noise)
+	//
+	// Rationale: if the canary host gives the SAME non-direct status on ANY path
+	// when it is the 2nd request, the difference is driven purely by host routing
+	// (e.g. virtual-host mismatch always returns 421/400) rather than by connection
+	// state. Only if the alternate path produces a DIFFERENT status than the original
+	// indirect status does the signal become path-specific — i.e. the server's state
+	// machine treats specific paths differently on reused connections → genuine desync.
 	noisePath := "/.well-known/cake"
 	noiseTrigger := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
@@ -134,20 +144,28 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 		return
 	}
 	defer connNoise.Close()
-	connNoise.Send([]byte(warmup))              //nolint:errcheck
-	rNoiseWarmup, _, _ := connNoise.RecvWithTimeout(cfg.Timeout)
-	if len(rNoiseWarmup) == 0 || request.ContainsStr(rNoiseWarmup, "connection: close") {
+	if err := connNoise.Send([]byte(warmup)); err != nil {
 		return
 	}
-	connNoise.Send([]byte(noiseTrigger)) //nolint:errcheck
+	rNoiseWarmup, _, tNoiseWarmup := connNoise.RecvWithTimeout(cfg.Timeout)
+	if tNoiseWarmup || len(rNoiseWarmup) == 0 || request.ContainsStr(rNoiseWarmup, "connection: close") {
+		return
+	}
+	if err := connNoise.Send([]byte(noiseTrigger)); err != nil {
+		return
+	}
 	rNoise, _, _ := connNoise.RecvWithTimeout(cfg.Timeout)
-	noiseStatus := request.StatusCode(rNoise)
+	noiseCakeStatus := request.StatusCode(rNoise)
 
-	dbg(cfg, "ConnState: noise=%d (direct=%d)", noiseStatus, directStatus)
-	if noiseStatus == directStatus {
+	dbg(cfg, "ConnState: noiseCake=%d indirect=%d direct=%d", noiseCakeStatus, indirectStatus, directStatus)
+
+	// Java: if indirect404code == indirectCode → noise (host-uniform behavior) → bail
+	if noiseCakeStatus == indirectStatus {
+		dbg(cfg, "ConnState: indirect status is path-uniform → host-routing noise, skipping")
 		return
 	}
-	dbg(cfg, "ConnState: DETECTED status divergence direct=%d indirect=%d noise=%d", directStatus, indirectStatus, noiseStatus)
+	dbg(cfg, "ConnState: DETECTED path-specific state divergence direct=%d indirect=%d noiseCake=%d",
+		directStatus, indirectStatus, noiseCakeStatus)
 
 	rep.Emit(report.Finding{
 		Target:    target.String(),
@@ -162,8 +180,8 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 				"Reference: https://portswigger.net/research/browser-powered-desync-attacks",
 			directStatus, indirectStatus),
 		Evidence: fmt.Sprintf(
-			"direct_status=%d indirect_status=%d noise_status=%d canary=%s",
-			directStatus, indirectStatus, noiseStatus, canary),
+			"direct_status=%d indirect_status=%d noise_cake_status=%d canary=%s",
+			directStatus, indirectStatus, noiseCakeStatus, canary),
 		RawProbe: request.Truncate(warmup+"\n---trigger---\n"+trigger, 768),
 	})
 }

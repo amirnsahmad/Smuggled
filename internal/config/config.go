@@ -62,6 +62,7 @@ type Config struct {
 	SkipH2Tunnel      bool
 	SkipHeaderRemoval bool
 	SkipPathCRLF      bool
+	SkipHiddenH2      bool
 
 	// Modules: if non-empty, only run modules whose name is in this list.
 	// Names: clte, tecl, cl0, chunksizes, parser, client-desync, conn-state,

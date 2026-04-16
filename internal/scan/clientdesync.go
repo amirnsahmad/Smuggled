@@ -70,6 +70,17 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 	if target.Scheme == "https" && request.ProbeH2(target, cfg) {
 		dbg(cfg, "ClientDesync: H2 probe CL=%d", csdProbeH2CL)
 
+		// Baseline: clean H2 GET to establish the expected status for this endpoint.
+		// A genuine CL-ignoring server returns the SAME status as it would for a
+		// complete request. A 4xx response that differs from the baseline means the
+		// server detected and rejected the malformed request — not a desync signal.
+		h2Base, h2BaseErr := h2RawRequest(target, "GET", path, host, "", nil, cfg)
+		h2BaseStatus := 0
+		if h2BaseErr == nil && h2Base != nil {
+			h2BaseStatus = h2Base.Status
+		}
+		dbg(cfg, "ClientDesync: H2 baseline status=%d", h2BaseStatus)
+
 		start := time.Now()
 		extra := map[string]string{
 			"content-length": fmt.Sprintf("%d", csdProbeH2CL),
@@ -79,9 +90,17 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 		h2resp, h2err := h2RawRequest(target, "POST", path, host, "", extra, cfg)
 		h2elapsed := time.Since(start)
 
-		dbg(cfg, "ClientDesync: H2 elapsed=%v threshold=%v err=%v", h2elapsed, timeoutThreshold, h2err)
+		dbg(cfg, "ClientDesync: H2 elapsed=%v threshold=%v err=%v status=%d baseline=%d",
+			h2elapsed, timeoutThreshold, h2err, func() int {
+				if h2resp != nil { return h2resp.Status }
+				return 0
+			}(), h2BaseStatus)
 
-		if h2err == nil && h2resp != nil && h2resp.Status != 0 && h2elapsed < timeoutThreshold {
+		// Only fire if the probe status matches the baseline status.
+		// A different status (especially 4xx when baseline is 2xx/3xx) indicates
+		// the server detected the missing body — not that it ignored CL.
+		h2StatusMatch := h2BaseStatus == 0 || (h2resp != nil && h2resp.Status == h2BaseStatus)
+		if h2err == nil && h2resp != nil && h2resp.Status != 0 && h2elapsed < timeoutThreshold && h2StatusMatch {
 			probe := fmt.Sprintf("POST %s HTTP/2\r\nHost: %s\r\ncontent-type: application/x-www-form-urlencoded\r\ncontent-length: %d\r\n\r\n",
 				path, host, csdProbeH2CL)
 			rep.Emit(report.Finding{
@@ -111,6 +130,12 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 	{
 		dbg(cfg, "ClientDesync: H1 probe CL=%d", csdProbeH1CL)
 
+		// Baseline: clean H1 GET to establish the expected status for this endpoint.
+		h1BaseReq := []byte("GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")
+		h1BaseResp, _, _, _ := request.RawRequest(target, h1BaseReq, cfg)
+		h1BaseStatus := request.StatusCode(h1BaseResp)
+		dbg(cfg, "ClientDesync: H1 baseline status=%d", h1BaseStatus)
+
 		var h1probe strings.Builder
 		h1probe.WriteString("POST " + path + " HTTP/1.1\r\n")
 		h1probe.WriteString("Host: " + host + "\r\n")
@@ -124,12 +149,16 @@ func ScanClientDesync(target *url.URL, base []byte, cfg config.Config, rep *repo
 		h1probeBytes := []byte(h1probe.String())
 
 		resp, elapsed, timedOut, err := request.RawRequest(target, h1probeBytes, cfg)
-		dbg(cfg, "ClientDesync: H1 elapsed=%v timedOut=%v status=%d err=%v",
-			elapsed, timedOut, request.StatusCode(resp), err)
+		dbg(cfg, "ClientDesync: H1 elapsed=%v timedOut=%v status=%d baseline=%d err=%v",
+			elapsed, timedOut, request.StatusCode(resp), h1BaseStatus, err)
 
 		if err == nil && !timedOut && len(resp) > 0 && elapsed < timeoutThreshold {
 			st := request.StatusCode(resp)
-			if st > 0 {
+			// Same guard as H2: probe status must match baseline. If the server returns
+			// a different status (e.g. 400 vs baseline 200/302), it detected the missing
+			// body rather than ignoring CL.
+			h1StatusMatch := h1BaseStatus == 0 || st == h1BaseStatus
+			if st > 0 && h1StatusMatch {
 				rep.Emit(report.Finding{
 					Target:    target.String(),
 					Method:    "POST",

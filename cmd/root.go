@@ -49,6 +49,7 @@ var (
 	flagSkipH2Tunnel      bool
 	flagSkipHeaderRemoval bool
 	flagSkipPathCRLF      bool
+	flagSkipHiddenH2      bool
 	flagResearch          bool
 	flagExitOnFind        bool
 	flagCalibrate         bool
@@ -141,6 +142,7 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagSkipH2Tunnel, "skip-h2-tunnel", false, "Skip H2 tunnel and HeadScanTE (overrides --skip-h2 for tunnel only)")
 	scanCmd.Flags().BoolVar(&flagSkipHeaderRemoval, "skip-header-removal", false, "Skip Keep-Alive header removal scan")
 	scanCmd.Flags().BoolVar(&flagSkipPathCRLF, "skip-path-crlf", false, "Skip path CRLF injection scans (H1 and H2)")
+	scanCmd.Flags().BoolVar(&flagSkipHiddenH2, "skip-hidden-h2", false, "Skip HiddenHTTP2 probe (hidden H2 via ALPN detection) within --research mode")
 	scanCmd.Flags().BoolVar(&flagResearch, "research", false, "Enable research-mode H2 probes (HTTP2FakePseudo, HTTP2Scheme, HTTP2DualPath, HTTP2Method, HiddenHTTP2)")
 	scanCmd.Flags().BoolVarP(&flagExitOnFind, "exit", "x", false,
 		"After the first finding in a module, skip remaining techniques in that module\n"+
@@ -247,6 +249,7 @@ func runScan(_ *cobra.Command, args []string) error {
 	skipH2Tunnel     := flagSkipH2Tunnel
 	skipHeaderRemoval := flagSkipHeaderRemoval
 	skipPathCRLF     := flagSkipPathCRLF
+	skipHiddenH2     := flagSkipHiddenH2
 	researchMode     := flagResearch
 
 	if flagAll {
@@ -305,6 +308,7 @@ func runScan(_ *cobra.Command, args []string) error {
 		SkipH2Tunnel:      skipH2Tunnel || skipH2,
 		SkipHeaderRemoval: skipHeaderRemoval,
 		SkipPathCRLF:      skipPathCRLF,
+		SkipHiddenH2:      skipHiddenH2,
 		ExtraHeaders:      flagHeaders,
 		Modules:           flagModules,
 		ResearchMode:      researchMode,
