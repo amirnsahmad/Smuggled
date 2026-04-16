@@ -55,7 +55,9 @@ func ScanH2Research(target *url.URL, base []byte, cfg config.Config, rep *report
 	scanH2Scheme(target, path, host, cfg, rep)
 	scanH2DualPath(target, path, host, cfg, rep)
 	scanH2Method(target, path, host, cfg, rep)
-	scanHiddenHTTP2(target, path, host, cfg, rep)
+	if !cfg.SkipHiddenH2 {
+		scanHiddenHTTP2(target, path, host, cfg, rep)
+	}
 }
 
 // ─── HTTP2FakePseudo ─────────────────────────────────────────────────────────

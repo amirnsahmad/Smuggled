@@ -89,20 +89,54 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep 
 		zName := zPrefixHeader(canary.headerName)
 
 		for _, hide := range hideTechs {
-			// Build all 4 hidden-pair variants for this (canary, technique) pair.
+			// Build all 4 hidden-pair variants for this (canary, technique) pair,
+			// each paired with a "missing" control that applies the same technique
+			// to a neutral "dummy" header instead of the real canary header.
+			//
+			// This mirrors Java's PermutationResult 4-way matrix:
+			//   hiddenCanaryPresent = technique applied with canary header
+			//   hiddenCanaryMissing = same technique structure, dummy header only
+			//
+			// DISCREPANCY condition (PermutationResult.classify() line 362):
+			//   hiddenPresent != hiddenMissing   → technique has different effect when canary present
+			//   hiddenMissing  == canaryMissing  → technique alone is neutral (= baseStatus)
+			//   hiddenPresent  != canaryPresent  → canary IS visible without hiding
+			//
+			// The missing control is the critical FP filter: if the hiding technique
+			// itself (irrespective of the canary) causes the status change, both
+			// hiddenPresent and hiddenMissing will differ from baseline, and we bail.
+			dummyMissing := injectHiddenHeader(canaryBase, "dummy", canary.value, hide)
+
 			type pairVariant struct {
-				label string
-				req   []byte
+				label   string
+				req     []byte // hiddenCanaryPresent
+				missing []byte // hiddenCanaryMissing control
 			}
 			variants := []pairVariant{
-				// 1. z-prefix, direct: hide technique applied to z-prefixed header name
-				{"z/" + string(hide), injectHiddenHeader(canaryBase, zName, canary.value, hide)},
-				// 2. real, direct: hide technique applied to real header name
-				{string(hide), injectHiddenHeader(canaryBase, canary.headerName, canary.value, hide)},
-				// 3. z-prefix, indirect: z-prefix header standalone + dummy hidden via technique
-				{"z-indirect/" + string(hide), injectHiddenIndirect(canaryBase, zName, canary.value, hide)},
-				// 4. real, indirect: real header standalone + dummy hidden via technique
-				{"indirect/" + string(hide), injectHiddenIndirect(canaryBase, canary.headerName, canary.value, hide)},
+				// 1. z-prefix, direct: technique applied to z-prefixed header name
+				{
+					label:   "z/" + string(hide),
+					req:     injectHiddenHeader(canaryBase, zName, canary.value, hide),
+					missing: dummyMissing,
+				},
+				// 2. real, direct: technique applied to real header name
+				{
+					label:   string(hide),
+					req:     injectHiddenHeader(canaryBase, canary.headerName, canary.value, hide),
+					missing: dummyMissing,
+				},
+				// 3. z-prefix, indirect: z-prefix header in normal position + dummy hidden via technique
+				{
+					label:   "z-indirect/" + string(hide),
+					req:     injectHiddenIndirect(canaryBase, zName, canary.value, hide),
+					missing: dummyMissing,
+				},
+				// 4. real, indirect: real header in normal position + dummy hidden via technique
+				{
+					label:   "indirect/" + string(hide),
+					req:     injectHiddenIndirect(canaryBase, canary.headerName, canary.value, hide),
+					missing: dummyMissing,
+				},
 			}
 
 			for _, v := range variants {
@@ -110,60 +144,82 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep 
 					continue
 				}
 
+				// hiddenCanaryPresent probe
 				resp, _, timedOut, err := request.RawRequest(target, v.req, cfg)
 				if err != nil || timedOut {
-					dbg(cfg, "Parser [%s/%s/%s]: err/timeout", canary.name, v.label, hide)
+					dbg(cfg, "Parser [%s/%s]: hiddenPresent err/timeout", canary.name, v.label)
+					continue
+				}
+				hiddenPresentStatus := request.StatusCode(resp)
+
+				// hiddenCanaryMissing control probe
+				missingResp, _, missingTimedOut, missingErr := request.RawRequest(target, v.missing, cfg)
+				if missingErr != nil || missingTimedOut {
+					dbg(cfg, "Parser [%s/%s]: hiddenMissing err/timeout", canary.name, v.label)
+					continue
+				}
+				hiddenMissingStatus := request.StatusCode(missingResp)
+
+				dbg(cfg, "Parser [%s/%s]: hiddenPresent=%d hiddenMissing=%d base=%d",
+					canary.name, v.label, hiddenPresentStatus, hiddenMissingStatus, baseStatus)
+
+				// DISCREPANCY: technique has a canary-dependent effect AND the
+				// technique alone is neutral (hiddenMissing == baseline).
+				// Without the missing control we'd fire on any technique-induced 400.
+				discrepancy := hiddenPresentStatus != hiddenMissingStatus &&
+					hiddenMissingStatus == baseStatus &&
+					hiddenPresentStatus != baseStatus
+
+				if !discrepancy {
 					continue
 				}
 
-				probeStatus := request.StatusCode(resp)
-				dbg(cfg, "Parser [%s/%s]: probe_status=%d base=%d", canary.name, v.label, probeStatus, baseStatus)
-				interesting := false
-				desc := ""
-
+				var desc string
 				if canary.shouldBlock {
-					if probeStatus != baseStatus {
-						interesting = true
-						desc = fmt.Sprintf("status changed %d→%d with hidden %s header (technique=%s); "+
-							"possible parser discrepancy allowing desync", baseStatus, probeStatus, canary.name, v.label)
-					}
+					desc = fmt.Sprintf(
+						"Parser discrepancy: hidden %s header (technique=%s) produced status %d "+
+							"(base=%d), but same technique on dummy header produced %d (= base). "+
+							"The technique hid the canary from the front-end while the back-end still acted on it.",
+						canary.name, v.label, hiddenPresentStatus, baseStatus, hiddenMissingStatus)
 				} else {
-					if probeStatus >= 400 && baseStatus < 400 {
-						interesting = true
-						desc = fmt.Sprintf("status %d with %s (hidden via %s) suggests back-end rejects header front-end forwards",
-							probeStatus, canary.name, v.label)
-					}
+					desc = fmt.Sprintf(
+						"Parser discrepancy: hidden %s header (technique=%s) produced status %d "+
+							"(base=%d), back-end rejected a header the front-end never saw.",
+						canary.name, v.label, hiddenPresentStatus, baseStatus)
 				}
 
-				if interesting {
-					confirmedCount := 0
-					for i := 0; i < cfg.ConfirmReps; i++ {
-						r2, _, t2, e2 := request.RawRequest(target, v.req, cfg)
-						if e2 != nil || t2 {
-							continue
-						}
-						if request.StatusCode(r2) == probeStatus {
-							confirmedCount++
-						}
-					}
-					if confirmedCount == 0 {
-						rep.Log("ParserDiscrepancy: inconsistent result for %s/%s, skipping", canary.name, v.label)
+				// Confirmation: repeat hiddenPresent probe cfg.ConfirmReps times.
+				// Mirrors Java's consistent(3) — all 4 responses must be stable.
+				confirmedCount := 0
+				for i := 0; i < cfg.ConfirmReps; i++ {
+					r2, _, t2, e2 := request.RawRequest(target, v.req, cfg)
+					if e2 != nil || t2 {
 						continue
 					}
-
-					rep.Emit(report.Finding{
-						Target:      target.String(),
-						Method:      config.EffectiveMethods(cfg)[0],
-						Severity:    report.SeverityInfo,
-						Type:        "parser-discrepancy",
-						Technique:   v.label + "/" + canary.name,
-						Description: desc,
-						RawProbe:    request.Truncate(string(v.req), 512),
-						RawResponse: request.Truncate(request.SanitizeResponse(resp), 256),
-					})
-					if cfg.ExitOnFind {
-						return
+					if request.StatusCode(r2) == hiddenPresentStatus {
+						confirmedCount++
 					}
+				}
+				if confirmedCount == 0 {
+					rep.Log("ParserDiscrepancy: inconsistent result for %s/%s, skipping", canary.name, v.label)
+					continue
+				}
+
+				rep.Emit(report.Finding{
+					Target:    target.String(),
+					Method:    config.EffectiveMethods(cfg)[0],
+					Severity:  report.SeverityInfo,
+					Type:      "parser-discrepancy",
+					Technique: v.label + "/" + canary.name,
+					Description: desc,
+					Evidence: fmt.Sprintf(
+						"hiddenPresent=%d hiddenMissing=%d base=%d technique=%s canary=%s",
+						hiddenPresentStatus, hiddenMissingStatus, baseStatus, v.label, canary.name),
+					RawProbe:    request.Truncate(string(v.req), 512),
+					RawResponse: request.Truncate(request.SanitizeResponse(resp), 256),
+				})
+				if cfg.ExitOnFind {
+					return
 				}
 			}
 		}
