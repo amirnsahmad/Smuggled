@@ -80,6 +80,10 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep 
 	}
 	baseStatus := request.StatusCode(baseResp)
 	dbg(cfg, "Parser: baseline status=%d", baseStatus)
+	if isRateLimited(baseStatus) {
+		rep.Log("ParserDiscrepancy: baseline returned %d (rate limited), skipping", baseStatus)
+		return
+	}
 
 	for _, canary := range canaries {
 		canaryBase := clean
@@ -166,9 +170,12 @@ func ScanParserDiscrepancy(target *url.URL, base []byte, cfg config.Config, rep 
 				// DISCREPANCY: technique has a canary-dependent effect AND the
 				// technique alone is neutral (hiddenMissing == baseline).
 				// Without the missing control we'd fire on any technique-induced 400.
+				// Rate-limited responses (429/503) are never a genuine signal.
 				discrepancy := hiddenPresentStatus != hiddenMissingStatus &&
 					hiddenMissingStatus == baseStatus &&
-					hiddenPresentStatus != baseStatus
+					hiddenPresentStatus != baseStatus &&
+					!isRateLimited(hiddenPresentStatus) &&
+					!isRateLimited(hiddenMissingStatus)
 
 				if !discrepancy {
 					continue

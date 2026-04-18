@@ -83,10 +83,13 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 		return
 	}
 	defer connDirect.Close()
+	dbg(cfg, "ConnState → [direct] trigger (%d bytes):\n%s", len(trigger), trigger)
 	if err := connDirect.Send([]byte(trigger)); err != nil {
 		return
 	}
-	rDirect, _, tDirect := connDirect.RecvWithTimeout(cfg.Timeout)
+	rDirect, elDirect, tDirect := connDirect.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnState ← [direct] status=%d len=%d elapsed=%v timedOut=%v",
+		request.StatusCode(rDirect), len(rDirect), elDirect, tDirect)
 	if tDirect || len(rDirect) == 0 {
 		return
 	}
@@ -98,10 +101,13 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 		return
 	}
 	defer connKA.Close()
+	dbg(cfg, "ConnState → [warmup] (%d bytes):\n%s", len(warmup), warmup)
 	if err := connKA.Send([]byte(warmup)); err != nil {
 		return
 	}
-	rWarmup, _, tWarmup := connKA.RecvWithTimeout(cfg.Timeout)
+	rWarmup, elWarmup, tWarmup := connKA.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnState ← [warmup] status=%d len=%d elapsed=%v timedOut=%v",
+		request.StatusCode(rWarmup), len(rWarmup), elWarmup, tWarmup)
 	if tWarmup || len(rWarmup) == 0 {
 		return
 	}
@@ -109,16 +115,23 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 		rep.Log("ConnectionState: server closed after warmup, not keep-alive capable")
 		return
 	}
+	dbg(cfg, "ConnState → [indirect] trigger (%d bytes):\n%s", len(trigger), trigger)
 	if err := connKA.Send([]byte(trigger)); err != nil {
 		return
 	}
-	rIndirect, _, tIndirect := connKA.RecvWithTimeout(cfg.Timeout)
+	rIndirect, elIndirect, tIndirect := connKA.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnState ← [indirect] status=%d len=%d elapsed=%v timedOut=%v",
+		request.StatusCode(rIndirect), len(rIndirect), elIndirect, tIndirect)
 	if tIndirect || len(rIndirect) == 0 {
 		return
 	}
 	indirectStatus := request.StatusCode(rIndirect)
 
 	dbg(cfg, "ConnState: direct=%d indirect=%d", directStatus, indirectStatus)
+	if isRateLimited(directStatus) || isRateLimited(indirectStatus) {
+		rep.Log("ConnectionState: rate-limited response (direct=%d indirect=%d), skipping", directStatus, indirectStatus)
+		return
+	}
 	if directStatus == indirectStatus {
 		return // no difference — not vulnerable
 	}
@@ -144,17 +157,23 @@ func ScanConnectionState(target *url.URL, base []byte, cfg config.Config, rep *r
 		return
 	}
 	defer connNoise.Close()
+	dbg(cfg, "ConnState → [noise warmup] (%d bytes):\n%s", len(warmup), warmup)
 	if err := connNoise.Send([]byte(warmup)); err != nil {
 		return
 	}
-	rNoiseWarmup, _, tNoiseWarmup := connNoise.RecvWithTimeout(cfg.Timeout)
+	rNoiseWarmup, elNoiseWarmup, tNoiseWarmup := connNoise.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnState ← [noise warmup] status=%d len=%d elapsed=%v timedOut=%v",
+		request.StatusCode(rNoiseWarmup), len(rNoiseWarmup), elNoiseWarmup, tNoiseWarmup)
 	if tNoiseWarmup || len(rNoiseWarmup) == 0 || request.ContainsStr(rNoiseWarmup, "connection: close") {
 		return
 	}
+	dbg(cfg, "ConnState → [noise trigger] (%d bytes):\n%s", len(noiseTrigger), noiseTrigger)
 	if err := connNoise.Send([]byte(noiseTrigger)); err != nil {
 		return
 	}
-	rNoise, _, _ := connNoise.RecvWithTimeout(cfg.Timeout)
+	rNoise, elNoise, _ := connNoise.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnState ← [noise trigger] status=%d len=%d elapsed=%v",
+		request.StatusCode(rNoise), len(rNoise), elNoise)
 	noiseCakeStatus := request.StatusCode(rNoise)
 
 	dbg(cfg, "ConnState: noiseCake=%d indirect=%d direct=%d", noiseCakeStatus, indirectStatus, directStatus)
@@ -222,10 +241,13 @@ func ScanConnectionStateReflect(target *url.URL, base []byte, cfg config.Config,
 		return
 	}
 	defer connDirect.Close()
+	dbg(cfg, "ConnStateReflect → [direct] trigger (%d bytes):\n%s", len(trigger), trigger)
 	if err := connDirect.Send([]byte(trigger)); err != nil {
 		return
 	}
-	rDirect, _, tDirect := connDirect.RecvWithTimeout(cfg.Timeout)
+	rDirect, elDirect, tDirect := connDirect.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnStateReflect ← [direct] status=%d len=%d elapsed=%v timedOut=%v",
+		request.StatusCode(rDirect), len(rDirect), elDirect, tDirect)
 	if tDirect || len(rDirect) == 0 {
 		return
 	}
@@ -237,25 +259,34 @@ func ScanConnectionStateReflect(target *url.URL, base []byte, cfg config.Config,
 		return
 	}
 	defer connKA.Close()
+	dbg(cfg, "ConnStateReflect → [warmup] (%d bytes):\n%s", len(warmup), warmup)
 	if err := connKA.Send([]byte(warmup)); err != nil {
 		return
 	}
-	rWarmup, _, tWarmup := connKA.RecvWithTimeout(cfg.Timeout)
+	rWarmup, elWarmup, tWarmup := connKA.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnStateReflect ← [warmup] status=%d len=%d elapsed=%v timedOut=%v",
+		request.StatusCode(rWarmup), len(rWarmup), elWarmup, tWarmup)
 	if tWarmup || len(rWarmup) == 0 {
 		return
 	}
 	if request.ContainsStr(rWarmup, "connection: close") {
 		return
 	}
+	dbg(cfg, "ConnStateReflect → [indirect] trigger (%d bytes):\n%s", len(trigger), trigger)
 	if err := connKA.Send([]byte(trigger)); err != nil {
 		return
 	}
-	rIndirect, _, tIndirect := connKA.RecvWithTimeout(cfg.Timeout)
+	rIndirect, elIndirect, tIndirect := connKA.RecvWithTimeout(cfg.Timeout)
+	dbg(cfg, "ConnStateReflect ← [indirect] status=%d len=%d elapsed=%v timedOut=%v",
+		request.StatusCode(rIndirect), len(rIndirect), elIndirect, tIndirect)
 	if tIndirect || len(rIndirect) == 0 {
 		return
 	}
 	indirectCount := countOccurrences(rIndirect, []byte(canary))
 
+	if isRateLimited(request.StatusCode(rDirect)) || isRateLimited(request.StatusCode(rIndirect)) {
+		return
+	}
 	if directCount == indirectCount {
 		return // same reflection count — not vulnerable
 	}
@@ -394,9 +425,12 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 		rep.Log("PauseDesync: baseline dial error: %v", err)
 		return
 	}
+	dbg(cfg, "PauseDesync → [baseline] (%d bytes):\n%s", len(normalGET), normalGET)
 	connBaseline.Send([]byte(normalGET)) //nolint:errcheck
-	rBaseline, _, _ := connBaseline.RecvWithTimeout(cfg.Timeout)
+	rBaseline, elBaseline, _ := connBaseline.RecvWithTimeout(cfg.Timeout)
 	connBaseline.Close()
+	dbg(cfg, "PauseDesync ← [baseline] status=%d len=%d elapsed=%v",
+		request.StatusCode(rBaseline), len(rBaseline), elBaseline)
 	if len(rBaseline) == 0 {
 		return
 	}
@@ -415,6 +449,7 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 	}
 	defer conn.Close()
 
+	dbg(cfg, "PauseDesync → [headers-only] (%d bytes):\n%s", len(headers), headers)
 	if err := conn.Send([]byte(headers)); err != nil {
 		return
 	}
@@ -467,6 +502,7 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 	}
 
 	// ── Step 4: send smuggled body — treated as new request on poisoned connection ─
+	dbg(cfg, "PauseDesync → [smuggled body] (%d bytes):\n%s", len(smuggledBody), smuggledBody)
 	if err := conn.Send([]byte(smuggledBody)); err != nil {
 		return
 	}
@@ -476,9 +512,9 @@ func ScanPauseDesync(target *url.URL, base []byte, cfg config.Config, rep *repor
 	if remainingTimeout < time.Second {
 		remainingTimeout = time.Second
 	}
-	r1, _, r1TimedOut := conn.RecvWithTimeout(remainingTimeout)
+	r1, elR1, r1TimedOut := conn.RecvWithTimeout(remainingTimeout)
 	r1Status := request.StatusCode(r1)
-	dbg(cfg, "PauseDesync: r1 status=%d len=%d timeout=%v", r1Status, len(r1), r1TimedOut)
+	dbg(cfg, "PauseDesync ← [r1] status=%d len=%d elapsed=%v timedOut=%v", r1Status, len(r1), elR1, r1TimedOut)
 
 	// Determine signal type (mirrors Java: reflect / expected-response / status)
 	poisonExpect := "image/" // favicon content-type signal

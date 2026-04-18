@@ -113,6 +113,11 @@ func runHeaderStripProbe(target *url.URL, path, host string, st headerStripTarge
 		request.ContainsStr(attackResp, st.canary),
 		request.ContainsStr(harmlessResp, st.canary))
 
+	if isRateLimited(request.StatusCode(attackResp)) || isRateLimited(request.StatusCode(harmlessResp)) {
+		dbg(cfg, "HeaderRemoval[%s]: rate-limited response, skipping", st.strip)
+		return
+	}
+
 	if request.StatusCode(attackResp) == request.StatusCode(harmlessResp) &&
 		request.ContainsStr(attackResp, st.canary) == request.ContainsStr(harmlessResp, st.canary) {
 		return
@@ -124,6 +129,9 @@ func runHeaderStripProbe(target *url.URL, path, host string, st headerStripTarge
 		hr, _, _, e1 := request.RawRequest(target, harmless, cfg)
 		ar, _, _, e2 := request.RawRequest(target, attack, cfg)
 		if e1 != nil || e2 != nil {
+			continue
+		}
+		if isRateLimited(request.StatusCode(ar)) || isRateLimited(request.StatusCode(hr)) {
 			continue
 		}
 		if request.StatusCode(ar) != request.StatusCode(hr) ||
