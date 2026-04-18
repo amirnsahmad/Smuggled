@@ -182,6 +182,11 @@ func scanH2DualPath(target *url.URL, path, host string, cfg config.Config, rep *
 	}
 	status3 := resp3.Status
 
+	// Rate-limited responses are never a genuine dual-path signal.
+	if isRateLimited(status2) || isRateLimited(status3) {
+		dbg(cfg, "H2DualPath: rate-limited response (status2=%d status3=%d), skipping", status2, status3)
+		return
+	}
 	// Signal: statuses diverge between the two orderings → server processes one :path differently
 	if status1 == status2 && status1 == status3 {
 		return // all same — no path confusion

@@ -166,13 +166,20 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 	method := config.EffectiveMethod(cfg, true)
 	basePost := request.BuildKeepAliveRequest(method, path, host)
 
-	// Establish baseline status for status-divergence detection
-	baseResp, _, _, _ := request.RawRequest(target, basePost, cfg)
-	baseStatus := request.StatusCode(baseResp)
-	dbg(cfg, "baseline status=%d", baseStatus)
-
 	// Build a clean probe request (Connection: close GET to same path)
 	probeReq := request.BuildGETRequest("GET "+path+" HTTP/1.1", host)
+
+	// Establish baseline using probeReq (GET), not basePost (POST).
+	// Detection 2 compares probe status against baseline — if baseline uses a
+	// different method (POST → 404) but probe is GET (→ 200), the divergence
+	// is a method difference, not a CL.0 signal.
+	baseResp, _, _, _ := request.RawRequest(target, probeReq, cfg)
+	baseStatus := request.StatusCode(baseResp)
+	dbg(cfg, "baseline status=%d", baseStatus)
+	if isRateLimited(baseStatus) {
+		rep.Log("CL.0: baseline returned %d (rate limited), skipping %s", baseStatus, host)
+		return
+	}
 
 	// Detect which gadget is viable
 	gadget := selectCL0Gadget(target, basePost, cfg, rep)
@@ -371,6 +378,10 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 	}
 	baseStatus := baseline.Status
 	dbg(cfg, "H2CL0: baseline status=%d gadget=%q", baseStatus, gadget.payload)
+	if isRateLimited(baseStatus) {
+		rep.Log("H2CL0: baseline returned %d (rate limited), skipping %s", baseStatus, host)
+		return
+	}
 
 	// Header permutations — each isolates a specific CL.0 trigger mechanism.
 	// Mirrors the exact techniques observed in Burp Suite's H2 CL.0 scanner.
