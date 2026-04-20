@@ -36,6 +36,7 @@ package scan
 import (
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/smuggled/smuggled/internal/config"
@@ -158,6 +159,26 @@ func ScanPathCRLFInject(target *url.URL, base []byte, cfg config.Config, rep *re
 		// that confirms CRLF injection reached the back-end even without a timeout.
 		if err == nil && v.canaryHost != "" && !timedOut && !delayed &&
 			request.ContainsStr(respBody, v.canaryHost) {
+
+			// Control probe: same path but with Content-Length: 0 instead of CL=100.
+			// If the canary is reflected with CL=0 too, the server is echoing the
+			// URL back (e.g. 301/error page includes the raw path, which contains
+			// "Host:%20<canary>" as a substring) — not a genuine CRLF injection.
+			clStr := fmt.Sprintf("%d", pathCRLFInjectCL)
+			controlPath := strings.ReplaceAll(injectedPath,
+				"Content-Length:%20"+clStr, "Content-Length:%200")
+			controlReq := []byte("GET " + controlPath + " HTTP/1.1\r\n" +
+				"Host: " + host + "\r\n" +
+				"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n" +
+				"Connection: close\r\n" +
+				"\r\n")
+			controlBody, _, _, _ := request.RawRequest(target, controlReq, cfg)
+			if request.ContainsStr(controlBody, v.canaryHost) {
+				dbg(cfg, "[%s]: canary also reflected with CL=0 — URL echo FP, skipping", label)
+				rep.Log("PathCRLF [%s]: FP filtered — canary reflected with CL=0 control on %s", label, host)
+				continue
+			}
+
 			rep.Emit(report.Finding{
 				Target:    target.String(),
 				Method:    config.EffectiveMethods(cfg)[0],
@@ -254,6 +275,21 @@ func ScanPathCRLFInject(target *url.URL, base []byte, cfg config.Config, rep *re
 		// ── Reflection detection (fast response) ─────────────────────────────
 		if err == nil && v.canaryHost != "" && resp != nil && resp.Status != 0 &&
 			!timedOut && !delayed && request.ContainsStr(resp.Body, v.canaryHost) {
+
+			// Control probe: same :path but with Content-Length: 0.
+			// Canary reflected with CL=0 too → server echoes the URL → FP.
+			clStr := fmt.Sprintf("%d", pathCRLFInjectCL)
+			controlPath := strings.ReplaceAll(injectedPath,
+				"Content-Length:%20"+clStr, "Content-Length:%200")
+			controlExtra := map[string]string{":path": controlPath}
+			controlResp, controlErr := h2RawRequest(target, "GET", path, h2host, "", controlExtra, cfg)
+			if controlErr == nil && controlResp != nil &&
+				request.ContainsStr(controlResp.Body, v.canaryHost) {
+				dbg(cfg, "[%s]: canary also reflected with CL=0 — URL echo FP, skipping", label)
+				rep.Log("PathCRLF [%s]: FP filtered — canary reflected with CL=0 control on %s", label, h2host)
+				continue
+			}
+
 			rawProbe := fmt.Sprintf("GET %s HTTP/2\r\nHost: %s\r\n:path: %s\r\n\r\n",
 				path, h2host, injectedPath)
 			rep.Emit(report.Finding{

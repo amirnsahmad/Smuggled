@@ -266,6 +266,21 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 				probeStatus != baseStatus && probeStatus != 429 && gadgetStatusMatch {
 				dbg(cfg, "[%s]: status divergence at attempt %d: base=%d probe=%d gadget_expected=%d",
 					mut.name, i, baseStatus, probeStatus, gadget.responseStatus)
+
+				// Unstable-baseline guard: send a clean probe (no preceding smuggle).
+				// If it returns the same status AND same body length as the diverged
+				// probe, the server is non-deterministic for this endpoint — the
+				// divergence is not caused by smuggling.
+				// Body length is measured directly (Content-Length may be absent).
+				cleanCheck, _, cleanTimeout, cleanErr := request.RawRequest(target, probeReq, cfg)
+				if cleanErr == nil && !cleanTimeout &&
+					request.StatusCode(cleanCheck) == probeStatus &&
+					len(cleanCheck) == len(probeResp) {
+					dbg(cfg, "[%s]: clean probe returns %d len=%d (same as probe) — unstable baseline FP, skipping",
+						mut.name, probeStatus, len(cleanCheck))
+					break
+				}
+
 				rep.Emit(report.Finding{
 					Target:   target.String(),
 					Method:   config.EffectiveMethods(cfg)[0],
