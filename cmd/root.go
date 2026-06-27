@@ -40,6 +40,8 @@ var (
 	flagSkipH2            bool
 	flagSkipParser        bool
 	flagSkipClientDesync  bool
+	flagSkipPipelineDesync bool
+	flagSkipContamination bool
 	flagSkipPause         bool
 	flagSkipImplicit      bool
 	flagSkipConnState     bool
@@ -133,6 +135,8 @@ func init() {
 	scanCmd.Flags().BoolVar(&flagSkipH2, "skip-h2", false, "Skip HTTP/2 downgrade, H2 tunnel and HeadScanTE scans")
 	scanCmd.Flags().BoolVar(&flagSkipParser, "skip-parser", false, "Skip parser discrepancy scans")
 	scanCmd.Flags().BoolVar(&flagSkipClientDesync, "skip-client-desync", false, "Skip client-side desync scans")
+	scanCmd.Flags().BoolVar(&flagSkipPipelineDesync, "skip-pipeline-desync", false, "Skip pipeline-based browser desync scans")
+	scanCmd.Flags().BoolVar(&flagSkipContamination, "skip-contamination", false, "Skip HEAD body contamination scans")
 	scanCmd.Flags().BoolVar(&flagSkipPause, "skip-pause", false, "Skip pause-based desync scans")
 	scanCmd.Flags().BoolVar(&flagSkipImplicit, "skip-implicit", false, "Skip implicit zero CL scans")
 	scanCmd.Flags().BoolVar(&flagSkipConnState, "skip-conn-state", false, "Skip connection state manipulation scans")
@@ -166,8 +170,9 @@ func init() {
 	scanCmd.Flags().StringSliceVar(&flagTechniques, "techniques", nil, "Comma-separated technique names to run (default: all). See 'techniques' subcommand.")
 	scanCmd.Flags().StringSliceVar(&flagModules, "modules", nil,
 		"Comma-separated module names to run (default: all). When set, --skip-* flags are ignored.\n"+
-			"  Modules: clte, tecl, cl0, chunksizes, parser, client-desync, conn-state,\n"+
-			"  pause, implicit-zero, h1-tunnel, header-removal, h2, h2-tunnel, h2-research.")
+			"  Modules: clte, tecl, cl0, chunksizes, parser, client-desync, pipeline-desync,\n"+
+			"  contamination, conn-state, pause, implicit-zero, h1-tunnel, header-removal,\n"+
+			"  h2, h2-tunnel, h2-research, path-crlf.")
 	scanCmd.Flags().StringArrayVarP(&flagHeaders, "header", "H", nil,
 		"Add a custom header to all requests (repeatable). Format: \"Name: Value\".\n"+
 			"  Examples: -H \"Authorization: Bearer token\" -H \"Cookie: session=abc\".\n"+
@@ -240,6 +245,8 @@ func runScan(_ *cobra.Command, args []string) error {
 	skipH2           := flagSkipH2
 	skipParser       := flagSkipParser
 	skipClientDesync := flagSkipClientDesync
+	skipPipelineDesync := flagSkipPipelineDesync
+	skipContamination := flagSkipContamination
 	skipPause        := flagSkipPause
 	skipImplicit     := flagSkipImplicit
 	skipConnState    := flagSkipConnState
@@ -262,6 +269,8 @@ func runScan(_ *cobra.Command, args []string) error {
 		_ = skipH2
 		_ = skipParser
 		_ = skipClientDesync
+		_ = skipPipelineDesync
+		_ = skipContamination
 		_ = skipPause
 		_ = skipImplicit
 		_ = skipConnState
@@ -299,6 +308,8 @@ func runScan(_ *cobra.Command, args []string) error {
 		SkipH2:            skipH2,
 		SkipParser:        skipParser,
 		SkipClientDesync:  skipClientDesync,
+		SkipPipelineDesync: skipPipelineDesync,
+		SkipContamination: skipContamination,
 		SkipPause:         skipPause,
 		SkipImplicitZero:  skipImplicit,
 		SkipConnState:     skipConnState,

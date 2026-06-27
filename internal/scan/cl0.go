@@ -234,6 +234,13 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 
 			// ── Detection 1: Gadget bleed (CONFIRMED) ────────────────
 			if gadgetMatches(probeResp, gadget) {
+				// Java FP guard: if the gadget matches on the very first attempt,
+				// the endpoint naturally returns this content — not a smuggle signal.
+				if i == 0 {
+					dbg(cfg, "[%s]: gadget matched on attempt 0 — endpoint naturally contains marker, skipping technique",
+						mut.name)
+					break
+				}
 				dbg(cfg, "[%s]: CONFIRMED gadget bleed at attempt %d", mut.name, i)
 				rep.Emit(report.Finding{
 					Target:   target.String(),
@@ -255,30 +262,75 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 			}
 
 			// ── Detection 2: Status divergence (PROBABLE) ────────────
-			// Guard: probe status must match the gadget's own response status.
-			// In genuine CL.0 poisoning the probe receives the smuggled request's
-			// response — so its status should equal what the gadget returned when
-			// fired directly. A different status (e.g. probe=200, gadget=404) means
-			// the probe got its own response, not the smuggled one (Cloudflare FP pattern).
-			// When gadget.responseStatus == 0 (TRACE fallback), skip the guard.
-			gadgetStatusMatch := gadget.responseStatus == 0 || probeStatus == gadget.responseStatus
-			if i > 0 && baseStatus > 0 && probeStatus > 0 &&
-				probeStatus != baseStatus && probeStatus != 429 && gadgetStatusMatch {
+			//
+			// IMPORTANT: The Java (PortSwigger) scanner does NOT have a generic
+			// status-divergence detection for CL.0. Its primary signal is gadget
+			// content leakage (Detection 1 above). The only status-based check in
+			// Java is "Potential 0.CL" which fires exclusively when probe=400 and
+			// baseline!=400, confirmed with 30 benign requests (our Detection 3).
+			//
+			// This Detection 2 is an extension that fires when:
+			//   - The probe status matches what the gadget returns (gadget-status guard)
+			//   - The divergence is cross-class (e.g. 200→405, not 404→403)
+			//   - Reproduces multiple times
+			//   - Clean probes don't show the same divergence
+			//
+			// When gadget.responseStatus == 0 (TRACE fallback — meaning we couldn't
+			// verify the gadget's own status), we SKIP this detection entirely.
+			// Without knowing what status the smuggled response should produce,
+			// any divergence is speculative and generates WAF/CDN false positives.
+			if gadget.responseStatus != 0 && probeStatus == gadget.responseStatus &&
+				i > 0 && baseStatus > 0 && probeStatus > 0 &&
+				probeStatus != baseStatus && probeStatus != 429 {
 				dbg(cfg, "[%s]: status divergence at attempt %d: base=%d probe=%d gadget_expected=%d",
 					mut.name, i, baseStatus, probeStatus, gadget.responseStatus)
 
-				// Unstable-baseline guard: send a clean probe (no preceding smuggle).
-				// If it returns the same status AND same body length as the diverged
-				// probe, the server is non-deterministic for this endpoint — the
-				// divergence is not caused by smuggling.
-				// Body length is measured directly (Content-Length may be absent).
-				cleanCheck, _, cleanTimeout, cleanErr := request.RawRequest(target, probeReq, cfg)
-				if cleanErr == nil && !cleanTimeout &&
-					request.StatusCode(cleanCheck) == probeStatus &&
-					len(cleanCheck) == len(probeResp) {
-					dbg(cfg, "[%s]: clean probe returns %d len=%d (same as probe) — unstable baseline FP, skipping",
-						mut.name, probeStatus, len(cleanCheck))
+				// Same-class filter: when both baseline and probe are in the same
+				// HTTP status class (e.g. both 4xx), the divergence is likely
+				// WAF/CDN noise rather than a genuine smuggling signal.
+				if baseStatus/100 == probeStatus/100 {
+					dbg(cfg, "[%s]: same HTTP class (%dxx→%dxx) — noise, skipping",
+						mut.name, baseStatus/100, probeStatus/100)
+					continue
+				}
+
+				// Unstable-baseline guard: send multiple clean probes (no preceding
+				// smuggle). If ANY returns the diverged status, the server is
+				// non-deterministic — not a CL.0 signal.
+				unstable := false
+				for c := 0; c < 3; c++ {
+					cleanCheck, _, cleanTimeout, cleanErr := request.RawRequest(target, probeReq, cfg)
+					if cleanErr == nil && !cleanTimeout &&
+						request.StatusCode(cleanCheck) == probeStatus {
+						dbg(cfg, "[%s]: clean probe %d returns %d (same as diverged) — unstable baseline FP",
+							mut.name, c, probeStatus)
+						unstable = true
+						break
+					}
+				}
+				if unstable {
 					break
+				}
+
+				// Reproduction guard: require the divergence to reproduce at least
+				// once more to filter transient WAF/CDN artifacts.
+				reproduced := false
+				for r := 0; r < 2; r++ {
+					reprResp, _, reprTimeout, reprErr := request.LastByteSyncProbe(
+						target, attackReq, probeReq, cfg)
+					if reprErr != nil || reprTimeout {
+						// Fallback to skip-read
+						_ = request.SendNoRecv(target, attackReq, cfg)
+						reprResp, _, reprTimeout, reprErr = request.RawRequest(target, probeReq, cfg)
+					}
+					if reprErr == nil && !reprTimeout && request.StatusCode(reprResp) == probeStatus {
+						reproduced = true
+						break
+					}
+				}
+				if !reproduced {
+					dbg(cfg, "[%s]: divergence did not reproduce — transient, skipping", mut.name)
+					continue
 				}
 
 				rep.Emit(report.Finding{
@@ -289,10 +341,11 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 					Technique: mut.name,
 					Description: fmt.Sprintf(
 						"CL.0 status divergence: technique '%s' caused probe status %d "+
-							"(baseline: %d) after %d smuggle attempts. The smuggled prefix "+
-							"may have altered backend routing.",
-						mut.name, probeStatus, baseStatus, i),
-					Evidence: fmt.Sprintf("baseline=%d probe=%d attempt=%d", baseStatus, probeStatus, i),
+							"(baseline: %d, matches gadget expected %d) after %d smuggle attempts. "+
+							"The smuggled prefix may have altered backend routing.",
+						mut.name, probeStatus, baseStatus, gadget.responseStatus, i),
+					Evidence: fmt.Sprintf("baseline=%d probe=%d gadget_expected=%d attempt=%d reproduced=true",
+						baseStatus, probeStatus, gadget.responseStatus, i),
 					RawProbe: request.Truncate(string(attackReq), 512),
 				})
 				if cfg.ExitOnFind {
@@ -301,14 +354,16 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 				break // found for this mutation — move to next
 			}
 
-			// ── Detection 3: Status 400 potential ────────────────────
-			if i > 0 && baseStatus > 0 && baseStatus < 400 && probeStatus == 400 {
+			// ── Detection 3: Status 400 potential (maps to Java "Potential 0.CL") ──
+			// Java fires when: probe=400, baseline!=400, then confirms with 30
+			// benign-body requests (all must return non-400). We use 15.
+			if i > 0 && baseStatus > 0 && baseStatus != 400 && probeStatus == 400 {
 				// Verify: mutation with harmless body should NOT cause 400
 				fakeReq := request.SetBody(basePost, " ")
 				fakeReq = request.SetContentLength(fakeReq, 1)
 				fakeReq = mut.mutate(fakeReq, "1")
 				allGood := true
-				for k := 0; k < 5; k++ {
+				for k := 0; k < 15; k++ {
 					fr, _, _, ferr := request.RawRequest(target, fakeReq, cfg)
 					if ferr != nil || request.StatusCode(fr) == 400 {
 						allGood = false
@@ -546,16 +601,22 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 
 // h2cl0runPerm executes a single H2 CL.0 permutation across cfg.Attempts attempts.
 // Returns true if a finding was emitted (used with ExitOnFind to short-circuit).
+//
+// Strategy: each attempt sends a BURST of attack requests (multiple streams)
+// followed by a single probe on the same H2 connection. This maximizes the
+// chance of poisoning the back-end TCP buffer — multiple attacks increase the
+// probability that at least one leaves the smuggled body for the probe to consume.
 func h2cl0runPerm(
 	target *url.URL, method, path, host, smuggledBody string,
 	extra map[string]string, permName string,
 	gadget *cl0Gadget, baseStatus int,
 	cfg config.Config, rep *report.Reporter,
 ) bool {
+	const burstSize = 5 // send 5 attacks before each probe
+
 	for attempt := 0; attempt < cfg.Attempts; attempt++ {
-		// Single-connection probe: attack on stream 1, probe GET on stream 3.
-		// Both streams share the same H2→back-end TCP connection.
-		_, probe, err := h2AttackAndProbe(target, method, path, host, smuggledBody, extra, cfg)
+		// Burst: N attack streams + 1 probe stream on the same H2 connection.
+		probe, err := h2BurstAttackAndProbe(target, method, path, host, smuggledBody, extra, burstSize, cfg)
 		if err != nil {
 			dbg(cfg, "H2CL0 [%s/%s]: attempt %d error: %v", method, permName, attempt, err)
 			continue
@@ -583,6 +644,12 @@ func h2cl0runPerm(
 
 		// ── Detection 1: gadget marker reflected (CONFIRMED) ─────────────
 		if gadgetFound {
+			// Java FP guard: gadget on first attempt = endpoint naturally returns it.
+			if attempt == 0 {
+				dbg(cfg, "H2CL0 [%s/%s]: gadget on attempt 0 — natural content, skipping",
+					method, permName)
+				break
+			}
 			dbg(cfg, "H2CL0 [%s/%s]: CONFIRMED gadget bleed at attempt %d", method, permName, attempt)
 			rep.Emit(report.Finding{
 				Target:    target.String(),
@@ -607,11 +674,38 @@ func h2cl0runPerm(
 		}
 
 		// ── Detection 2: status divergence (PROBABLE) ────────────────────
-		// Same guard as H1: probe status must match gadget's own response status.
-		gadgetStatusMatch := gadget.responseStatus == 0 || probeStatus == gadget.responseStatus
-		if attempt > 0 && probeStatus != baseStatus && probeStatus != 429 && gadgetStatusMatch {
+		// Same logic as H1: only fire when gadget.responseStatus is known (!=0)
+		// and probe matches it. When using TRACE fallback (responseStatus==0),
+		// skip entirely — without knowing the expected gadget status, any
+		// divergence is speculative and generates WAF/CDN false positives.
+		if gadget.responseStatus != 0 && probeStatus == gadget.responseStatus &&
+			attempt > 0 && probeStatus != baseStatus && probeStatus != 429 {
 			dbg(cfg, "H2CL0 [%s/%s]: status divergence at attempt %d: base=%d probe=%d gadget_expected=%d",
 				method, permName, attempt, baseStatus, probeStatus, gadget.responseStatus)
+
+			// Same-class filter: both baseline and probe in the same HTTP class
+			// (e.g. 404→403) is WAF/CDN noise, not a genuine CL.0 signal.
+			if baseStatus/100 == probeStatus/100 {
+				dbg(cfg, "H2CL0 [%s/%s]: same HTTP class (%dxx→%dxx) — skipping",
+					method, permName, baseStatus/100, probeStatus/100)
+				continue
+			}
+
+			// Reproduction guard: require divergence to reproduce at least once.
+			reproduced := false
+			for r := 0; r < 2; r++ {
+				reprProbe, reprErr := h2BurstAttackAndProbe(target, method, path, host, smuggledBody, extra, burstSize, cfg)
+				if reprErr == nil && reprProbe.Status == probeStatus {
+					reproduced = true
+					break
+				}
+			}
+			if !reproduced {
+				dbg(cfg, "H2CL0 [%s/%s]: divergence did not reproduce — transient, skipping",
+					method, permName)
+				continue
+			}
+
 			rep.Emit(report.Finding{
 				Target:    target.String(),
 				Method:    "HTTP/2",
@@ -619,17 +713,17 @@ func h2cl0runPerm(
 				Type:      "H2.CL0",
 				Technique: fmt.Sprintf("H2.CL0/%s/%s", method, permName),
 				Description: fmt.Sprintf(
-					"H2 CL.0 desync (single-connection): probe on stream 3 returned "+
-						"status %d vs baseline %d after %d attempts "+
-						"(technique=%s, method=%s). The smuggled prefix may have "+
-						"altered back-end routing on the shared connection.",
-					probeStatus, baseStatus, attempt, permName, method),
-				Evidence: fmt.Sprintf("attempt=%d probe_status=%d baseline=%d",
-					attempt, probeStatus, baseStatus),
+					"H2 CL.0 desync (burst): probe returned status %d vs baseline %d "+
+						"after %d attempts (%d attacks per burst, technique=%s, method=%s). "+
+						"The smuggled prefix may have altered back-end routing.",
+					probeStatus, baseStatus, attempt, burstSize, permName, method),
+				Evidence: fmt.Sprintf("attempt=%d burst=%d probe_status=%d baseline=%d reproduced=true",
+					attempt, burstSize, probeStatus, baseStatus),
 				RawProbe: fmt.Sprintf(
-					"[stream 1] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
-						"[stream 3] GET %s HTTP/2\r\nHost: %s\r\n",
-					method, path, host, extra, len(smuggledBody), smuggledBody, path, host),
+					"[streams 1-%d] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
+						"[stream %d] GET %s HTTP/2\r\nHost: %s\r\n",
+					burstSize*2-1, method, path, host, extra, len(smuggledBody), smuggledBody,
+					burstSize*2+1, path, host),
 			})
 			return true
 		}

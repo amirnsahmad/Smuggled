@@ -426,12 +426,12 @@ func ConfirmProbe(target *url.URL, payload []byte, cfg config.Config, logFn func
 	hits := 0
 	needed := cfg.ConfirmReps
 	for i := 0; i < needed+2; i++ {
-		_, _, timedOut, err := RawRequest(target, payload, cfg)
-		if err == nil && timedOut {
+		_, elapsed, timedOut, err := RawRequest(target, payload, cfg)
+		if err == nil && (timedOut || cfg.IsDelayed(elapsed)) {
 			hits++
 		}
 	}
-	logFn("%s confirmation: %d/%d timeouts", label, hits, needed)
+	logFn("%s confirmation: %d/%d timeouts/delays", label, hits, needed)
 	return hits >= needed
 }
 

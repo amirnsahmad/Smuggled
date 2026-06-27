@@ -48,21 +48,23 @@ type Config struct {
 	ScanHTTP2 bool
 
 	// Module skip flags
-	SkipCLTE          bool
-	SkipTECL          bool
-	SkipH2            bool
-	SkipParser        bool
-	SkipClientDesync  bool
-	SkipPause         bool
-	SkipImplicitZero  bool
-	SkipConnState     bool
-	SkipCL0           bool
-	SkipChunkSizes    bool
-	SkipH1Tunnel      bool
-	SkipH2Tunnel      bool
-	SkipHeaderRemoval bool
-	SkipPathCRLF      bool
-	SkipHiddenH2      bool
+	SkipCLTE            bool
+	SkipTECL            bool
+	SkipH2              bool
+	SkipParser          bool
+	SkipClientDesync    bool
+	SkipPipelineDesync  bool
+	SkipContamination   bool
+	SkipPause           bool
+	SkipImplicitZero    bool
+	SkipConnState       bool
+	SkipCL0             bool
+	SkipChunkSizes      bool
+	SkipH1Tunnel        bool
+	SkipH2Tunnel        bool
+	SkipHeaderRemoval   bool
+	SkipPathCRLF        bool
+	SkipHiddenH2        bool
 
 	// Modules: if non-empty, only run modules whose name is in this list.
 	// Names: clte, tecl, cl0, chunksizes, parser, client-desync, conn-state,
