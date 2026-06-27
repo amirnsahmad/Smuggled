@@ -115,8 +115,8 @@ func (s *Scanner) Scan(rawURL string) {
 // finding but all remaining modules still run (skip within, not across).
 func (s *Scanner) runModules(u *url.URL, base []byte, cfg config.Config, runH1, runH2 bool) {
 	rep := s.rep
-	dbg(cfg, "runModules: h1=%v h2=%v skipH2=%v skipParser=%v skipCL0=%v skipChunk=%v skipClient=%v skipConn=%v skipPause=%v skipImplicit=%v skipH1Tunnel=%v skipH2Tunnel=%v skipHeader=%v research=%v",
-		runH1, runH2, cfg.SkipH2, cfg.SkipParser, cfg.SkipCL0, cfg.SkipChunkSizes, cfg.SkipClientDesync, cfg.SkipConnState, cfg.SkipPause, cfg.SkipImplicitZero, cfg.SkipH1Tunnel, cfg.SkipH2Tunnel, cfg.SkipHeaderRemoval, cfg.ResearchMode)
+	dbg(cfg, "runModules: h1=%v h2=%v skipH2=%v skipParser=%v skipCL0=%v skipChunk=%v skipClient=%v skipPipeline=%v skipContam=%v skipConn=%v skipPause=%v skipImplicit=%v skipH1Tunnel=%v skipH2Tunnel=%v skipHeader=%v research=%v",
+		runH1, runH2, cfg.SkipH2, cfg.SkipParser, cfg.SkipCL0, cfg.SkipChunkSizes, cfg.SkipClientDesync, cfg.SkipPipelineDesync, cfg.SkipContamination, cfg.SkipConnState, cfg.SkipPause, cfg.SkipImplicitZero, cfg.SkipH1Tunnel, cfg.SkipH2Tunnel, cfg.SkipHeaderRemoval, cfg.ResearchMode)
 
 	if runH1 || runH2 {
 		if cfg.ModuleEnabled("path-crlf", cfg.SkipPathCRLF) {
@@ -142,6 +142,12 @@ func (s *Scanner) runModules(u *url.URL, base []byte, cfg config.Config, runH1, 
 		}
 		if cfg.ModuleEnabled("client-desync", cfg.SkipClientDesync) {
 			ScanClientDesync(u, base, cfg, rep)
+		}
+		if cfg.ModuleEnabled("pipeline-desync", cfg.SkipPipelineDesync) {
+			ScanPipelineDesync(u, base, cfg, rep)
+		}
+		if cfg.ModuleEnabled("contamination", cfg.SkipContamination) {
+			ScanContamination(u, base, cfg, rep)
 		}
 		if cfg.ModuleEnabled("conn-state", cfg.SkipConnState) {
 			ScanConnectionState(u, base, cfg, rep)
