@@ -85,6 +85,8 @@ func ScanH2Tunnel(target *url.URL, base []byte, cfg config.Config, rep *report.R
 							"stripping it, allowing injection of arbitrary HTTP/1.1 requests.",
 						method),
 					Evidence: fmt.Sprintf("trigger=%q mixed_response=true", trigger),
+					RawProbe: fmt.Sprintf("%s %s HTTP/2\r\n:authority: %s\r\ncontent-length: %d\r\n\r\n%s",
+						method, path, host, len(trigger), trigger),
 				})
 				if cfg.ExitOnFind {
 					return
@@ -148,6 +150,10 @@ func ScanHeadScanTE(target *url.URL, base []byte, cfg config.Config, rep *report
 			}
 
 			if mixedH2Response(h2resp) {
+				var hdrs string
+				for k, v := range extraHeaders {
+					hdrs += fmt.Sprintf("%s: %s\r\n", k, v)
+				}
 				rep.Emit(report.Finding{
 					Target:   target.String(),
 					Method:      "HTTP/2",
@@ -159,6 +165,8 @@ func ScanHeadScanTE(target *url.URL, base []byte, cfg config.Config, rep *report
 							"(method=%s, TE permutation=%s). The back-end is processing tunnelled requests.",
 						method, perm.name),
 					Evidence: "mixed_h2_response=true",
+					RawProbe: fmt.Sprintf("%s %s HTTP/2\r\n:authority: %s\r\n%scontent-length: %d\r\n\r\n%s",
+						method, path, host, hdrs, len(h2trigger), h2trigger),
 				})
 				if cfg.ExitOnFind {
 					return
@@ -233,6 +241,13 @@ func ScanH2TunnelCL(target *url.URL, base []byte, cfg config.Config, rep *report
 				}
 
 				if mixedH2Response(h2resp) {
+					var hdrs string
+					for k, v := range perm.extra {
+						if v == "" {
+							continue // suppressed header
+						}
+						hdrs += fmt.Sprintf("%s: %s\r\n", k, v)
+					}
 					rep.Emit(report.Finding{
 						Target:   target.String(),
 						Method:   "HTTP/2",
@@ -245,6 +260,8 @@ func ScanH2TunnelCL(target *url.URL, base []byte, cfg config.Config, rep *report
 								"forwarded the request body to the back-end without stripping it.",
 							method, perm.name),
 						Evidence: fmt.Sprintf("trigger=%q perm=%s mixed_response=true", trigger, perm.name),
+						RawProbe: fmt.Sprintf("%s %s HTTP/2\r\n:authority: %s\r\n%scontent-length: %d\r\n\r\n%s",
+							method, path, host, hdrs, len(trigger), trigger),
 					})
 					if cfg.ExitOnFind {
 						return
@@ -593,6 +610,17 @@ func h2BurstAttackAndProbe(
 	// ── Send burstCount attack streams (odd IDs: 1, 3, 5, ...) ───────────
 	// H2 client-initiated streams use odd numbers.
 	probeStreamID := uint32(2*burstCount + 1) // probe gets the next odd ID after all attacks
+
+	clDisplay := clValue
+	if suppressCL {
+		clDisplay = "(suppressed)"
+	}
+	dbg(cfg, "h2Burst: attack=%s %s HTTP/2, :authority=%s, content-length=%s, body=%q",
+		pseudoMethod, pseudoPath, pseudoAuthority, clDisplay, body)
+	for k, v := range regularHeaders {
+		dbg(cfg, "h2Burst:   %s: %s", k, v)
+	}
+
 	for i := 0; i < burstCount; i++ {
 		streamID := uint32(2*i + 1)
 		hbuf.Reset()
@@ -651,10 +679,12 @@ func h2BurstAttackAndProbe(
 	for !probeDone && time.Now().Before(deadline) {
 		frame, err := framer.ReadFrame()
 		if err != nil {
+			dbg(cfg, "h2Burst: ReadFrame error: %v", err)
 			break
 		}
 		switch f := frame.(type) {
 		case *http2.DataFrame:
+			dbg(cfg, "h2Burst: [DATA stream=%d len=%d end=%v]", f.StreamID, len(f.Data()), f.StreamEnded())
 			if f.StreamID == probeStreamID {
 				probeBuf.Write(f.Data())
 				if f.StreamEnded() {
@@ -669,17 +699,27 @@ func h2BurstAttackAndProbe(
 						if hf.Name == ":status" {
 							fmt.Sscanf(hf.Value, "%d", &probeResp.Status)
 						}
+						dbg(cfg, "h2Burst: [HEADER stream=%d] %s: %s", f.StreamID, hf.Name, hf.Value)
 					}
 				}
 				if f.StreamEnded() {
 					probeDone = true
 				}
+			} else {
+				// Log headers from attack streams too
+				if fields, decErr := hpackDec.DecodeFull(f.HeaderBlockFragment()); decErr == nil {
+					for _, hf := range fields {
+						dbg(cfg, "h2Burst: [HEADER stream=%d] %s: %s", f.StreamID, hf.Name, hf.Value)
+					}
+				}
 			}
 		case *http2.RSTStreamFrame:
+			dbg(cfg, "h2Burst: [RST_STREAM stream=%d code=%v]", f.StreamID, f.ErrCode)
 			if f.StreamID == probeStreamID {
 				probeDone = true
 			}
 		case *http2.GoAwayFrame:
+			dbg(cfg, "h2Burst: [GOAWAY last_stream=%d code=%v]", f.LastStreamID, f.ErrCode)
 			probeDone = true
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
@@ -690,7 +730,18 @@ func h2BurstAttackAndProbe(
 		}
 	}
 
+	if !probeDone {
+		dbg(cfg, "h2Burst: deadline exceeded waiting for probe response")
+	}
+
 	probeResp.Body = probeBuf.Bytes()
+
+	dbg(cfg, "h2Burst: probe result — status=%d headers=%d body=%d bytes",
+		probeResp.Status, len(probeResp.Headers), len(probeResp.Body))
+	if cfg.Debug >= 2 && len(probeResp.Body) > 0 {
+		dbg(cfg, "h2Burst: probe body: %s", request.Truncate(string(probeResp.Body), 512))
+	}
+
 	return probeResp, nil
 }
 

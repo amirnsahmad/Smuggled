@@ -280,6 +280,107 @@ func SendNoRecv(target *url.URL, payload []byte, cfg config.Config) error {
 	return nil
 }
 
+// PipelineCL0Probe sends attack and probe on the SAME keep-alive connection.
+//
+// CL.0 detection REQUIRES same-connection semantics:
+//  1. Send attack request (with mutated CL that front-end interprets as 0)
+//  2. Read and discard the response to the attack
+//  3. Send probe request on the same connection
+//  4. Read probe response — if CL.0 worked, the backend saw the attack body as
+//     a new request, so the probe response is the smuggled request's response
+//
+// This is the correct approach for CL.0 (used by James Kettle / PortSwigger).
+// The previous LastByteSyncProbe approach opened SEPARATE connections for attack
+// and probe, which meant the smuggled body was on a different TCP connection
+// from the probe — the probe could never see the poisoned data.
+func PipelineCL0Probe(target *url.URL, attack, probe []byte, cfg config.Config) (probeResp []byte, elapsed time.Duration, timedOut bool, err error) {
+	dl := cfg.DebugLog
+
+	conn, err := transport.Dial(target, cfg.Timeout, cfg.Proxy, cfg.SkipTLSVerify)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+
+	// Step 1: Send attack request
+	if err = conn.Send(attack); err != nil {
+		return nil, 0, false, fmt.Errorf("attack send: %w", err)
+	}
+	if dl != nil {
+		dl("PipelineCL0: attack sent (%d bytes)", len(attack))
+		if cfg.Debug >= 2 {
+			dl("--- ATTACK REQUEST ---\n%s\n--- END ATTACK ---", Truncate(string(attack), 4096))
+		}
+	}
+
+	// Step 2: Read attack response. Use a short timeout (3s) — if the server
+	// treats CL=0, it responds immediately. If it waits for body bytes, it
+	// will hang (meaning CL.0 didn't work for this technique).
+	attackTimeout := cfg.Timeout
+	if attackTimeout > 5*time.Second {
+		attackTimeout = 5 * time.Second
+	}
+	attackData, _, attackTimedOut := conn.RecvWithTimeout(attackTimeout)
+	if attackTimedOut && len(attackData) == 0 {
+		// Attack itself timed out — backend is waiting for body bytes
+		// (CL was not treated as 0). Not a CL.0.
+		if dl != nil {
+			dl("PipelineCL0: attack response timed out — CL was not treated as 0")
+		}
+		return nil, 0, true, nil
+	}
+	attackStatus := StatusCode(attackData)
+	if dl != nil {
+		dl("PipelineCL0: attack response status=%d len=%d", attackStatus, len(attackData))
+		if cfg.Debug >= 2 {
+			dl("--- ATTACK RESPONSE ---\n%s\n--- END ATTACK RESPONSE ---", Truncate(string(attackData), 4096))
+		}
+	}
+
+	// If the attack response includes "Connection: close", the server won't
+	// accept more requests on this connection — probe is impossible.
+	if ContainsStr(attackData, "connection: close") {
+		if dl != nil {
+			dl("PipelineCL0: server sent Connection: close after attack — no pipeline")
+		}
+		return nil, 0, false, fmt.Errorf("connection closed after attack")
+	}
+
+	// Step 3: Brief drain — read any remaining attack response bytes that
+	// might arrive in a second TCP segment. Use a very short timeout (200ms).
+	drainData, _, _ := conn.RecvWithTimeout(200 * time.Millisecond)
+	if len(drainData) > 0 && dl != nil {
+		dl("PipelineCL0: drained %d extra attack response bytes", len(drainData))
+	}
+
+	// Step 4: Send probe on the same connection
+	if err = conn.Send(probe); err != nil {
+		return nil, 0, false, fmt.Errorf("probe send: %w", err)
+	}
+	if dl != nil {
+		dl("PipelineCL0: probe sent (%d bytes)", len(probe))
+		if cfg.Debug >= 2 {
+			dl("--- PROBE REQUEST ---\n%s\n--- END PROBE ---", Truncate(string(probe), 4096))
+		}
+	}
+
+	// Step 5: Read probe response
+	probeData, probeDur, probeTimeout := conn.RecvWithTimeout(cfg.Timeout)
+	if probeTimeout && len(probeData) == 0 {
+		if dl != nil {
+			dl("PipelineCL0: probe TIMEOUT after %v", probeDur)
+		}
+		return nil, probeDur, true, nil
+	}
+	if dl != nil {
+		dl("PipelineCL0 ← probe status=%d len=%d elapsed=%v", StatusCode(probeData), len(probeData), probeDur)
+		if cfg.Debug >= 2 {
+			dl("--- PROBE RESPONSE ---\n%s\n--- END PROBE RESPONSE ---", Truncate(string(probeData), 4096))
+		}
+	}
+	return probeData, probeDur, false, nil
+}
+
 // LastByteSyncProbe implements last-byte synchronization for CL.0 detection.
 //
 // It opens two connections simultaneously:
@@ -368,6 +469,16 @@ func StatusCode(resp []byte) int {
 	return code
 }
 
+// BodyLength returns the byte length of the response body (after \r\n\r\n).
+// Returns 0 if no body separator is found.
+func BodyLength(resp []byte) int {
+	idx := bytes.Index(resp, []byte("\r\n\r\n"))
+	if idx < 0 || idx+4 >= len(resp) {
+		return 0
+	}
+	return len(resp) - idx - 4
+}
+
 // containsStr returns true if resp contains s (case-insensitive).
 func ContainsStr(resp []byte, s string) bool {
 	return bytes.Contains(bytes.ToLower(resp), []byte(strings.ToLower(s)))
@@ -396,6 +507,19 @@ func BuildKeepAliveRequest(method, path, host string) []byte {
 	b.WriteString("User-Agent: " + UserAgent + "\r\n")
 	b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
 	b.WriteString("Content-Length: 0\r\n")
+	b.WriteString("Connection: keep-alive\r\n")
+	b.WriteString("\r\n")
+	return []byte(b.String())
+}
+
+// BuildKeepAliveProbe builds a probe request for CL.0 same-connection testing.
+// Unlike BuildGETRequest (which uses Connection: close), this uses keep-alive
+// so it can be sent on the same connection after the attack.
+func BuildKeepAliveProbe(method, path, host string) []byte {
+	var b strings.Builder
+	b.WriteString(method + " " + path + " HTTP/1.1\r\n")
+	b.WriteString("Host: " + host + "\r\n")
+	b.WriteString("User-Agent: " + UserAgent + "\r\n")
 	b.WriteString("Connection: keep-alive\r\n")
 	b.WriteString("\r\n")
 	return []byte(b.String())
