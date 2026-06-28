@@ -45,25 +45,46 @@ type cl0Gadget struct {
 	lookFor        string // marker to search for in the follow-up probe response
 	headerOnly     bool   // true = only search in response headers, not body
 	responseStatus int    // HTTP status the gadget itself returns (0 = unknown/fallback)
+	responseLen    int    // body length of the gadget response (0 = unknown; used for size-based detection)
 }
 
 // clGadgets are the static candidate inner-requests for CL.0 gadget detection,
 // listed in priority order (most distinctive / cheapest first).
 // A dynamic canary-path gadget is prepended at runtime in selectCL0Gadget.
 var clGadgets = []cl0Gadget{
-	{"GET /wrtztrw?wrtztrw=wrtztrw HTTP/1.1", "wrtztrw", false, 0},
-	{"GET /robots.txt HTTP/1.1", "llow:", false, 0},
-	{"GET /favicon.ico HTTP/1.1", "image/", true, 0},
+	// Random path — most servers reflect it in 404 error pages.
+	{"GET /wrtztrw?wrtztrw=wrtztrw HTTP/1.1", "wrtztrw", false, 0, 0},
+
+	// Common endpoints likely to exist and produce distinctive responses.
+	// Even if marker doesn't match, status-divergence fallback catches 200 vs 404.
+	{"GET /ping HTTP/1.1", "pong", false, 0, 0},
+	{"GET /health HTTP/1.1", "\"status\"", false, 0, 0},
+	{"GET /healthz HTTP/1.1", "\"ok\"", false, 0, 0},
+	{"GET /readyz HTTP/1.1", "\"ok\"", false, 0, 0},
+	{"GET /livez HTTP/1.1", "\"ok\"", false, 0, 0},
+	{"GET /status HTTP/1.1", "\"status\"", false, 0, 0},
+	{"GET /.well-known/openid-configuration HTTP/1.1", "issuer", false, 0, 0},
+	{"GET /.well-known/security.txt HTTP/1.1", "Contact:", false, 0, 0},
+	{"GET /sitemap.xml HTTP/1.1", "urlset", false, 0, 0},
+	{"GET /api HTTP/1.1", "\"version\"", false, 0, 0},
+	{"GET /login HTTP/1.1", "password", false, 0, 0},
+	{"GET /server-status HTTP/1.1", "Apache", false, 0, 0},
+
+	// Standard files with distinctive content-type or body markers.
+	{"GET /robots.txt HTTP/1.1", "llow:", false, 0, 0},
+	{"GET /favicon.ico HTTP/1.1", "image/", true, 0, 0},
+
+	// Method/version tricks that produce distinctive status codes.
 	// "405 " (trailing space) avoids false positives from UUIDs/IDs containing
 	// "405" as a substring (e.g. x-request-id: ...-9405-...).
-	{"TRACE / HTTP/1.1", "405 ", true, 0},
-	{"GET / HTTP/2.2", "505 ", true, 0},
+	{"TRACE / HTTP/1.1", "405 ", true, 0, 0},
+	{"GET / HTTP/2.2", "505 ", true, 0, 0},
 }
 
 // cl0TraceGadget is the TRACE fallback used when no other gadget is viable.
 // Defined separately so ScanCL0 and ScanH2CL0 can reference it by name
-// rather than by index (index 3 = TRACE in the static list above).
-var cl0TraceGadget = &clGadgets[3]
+// rather than by index.
+var cl0TraceGadget = &clGadgets[len(clGadgets)-2] // TRACE / HTTP/1.1 is second-to-last
 
 // clMutation is a single Content-Length obfuscation technique.
 type clMutation struct {
@@ -166,14 +187,17 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 	method := config.EffectiveMethod(cfg, true)
 	basePost := request.BuildKeepAliveRequest(method, path, host)
 
-	// Build a clean probe request (Connection: close GET to same path)
-	probeReq := request.BuildGETRequest("GET "+path+" HTTP/1.1", host)
+	// Build probe request — must also use keep-alive since it's sent on the
+	// SAME connection after the attack (pipeline). Connection: close would
+	// tell the server to drop the connection before we can probe.
+	probeReq := request.BuildKeepAliveProbe("GET", path, host)
 
-	// Establish baseline using probeReq (GET), not basePost (POST).
+	// Establish baseline using a standalone GET (Connection: close is fine here).
 	// Detection 2 compares probe status against baseline — if baseline uses a
 	// different method (POST → 404) but probe is GET (→ 200), the divergence
 	// is a method difference, not a CL.0 signal.
-	baseResp, _, _, _ := request.RawRequest(target, probeReq, cfg)
+	baselineReq := request.BuildGETRequest("GET "+path+" HTTP/1.1", host)
+	baseResp, _, _, _ := request.RawRequest(target, baselineReq, cfg)
 	baseStatus := request.StatusCode(baseResp)
 	dbg(cfg, "baseline status=%d", baseStatus)
 	if isRateLimited(baseStatus) {
@@ -208,24 +232,16 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 		attackReq = mut.mutate(attackReq, clVal)
 
 		for i := 0; i < cfg.Attempts; i++ {
-			// ── Phase 1: Try last-byte-sync (best precision) ─────────
-			probeResp, _, probeTimeout, probeErr := request.LastByteSyncProbe(
+			// CL.0 requires attack + probe on the SAME keep-alive connection.
+			// The attack body stays in the TCP buffer if the server treats CL=0;
+			// the subsequent probe on that connection then receives the smuggled response.
+			probeResp, _, probeTimeout, probeErr := request.PipelineCL0Probe(
 				target, attackReq, probeReq, cfg)
 
 			if probeErr != nil || probeTimeout {
-				dbg(cfg, "[%s]: last-byte-sync attempt %d err=%v timeout=%v, trying skip-read",
+				dbg(cfg, "[%s]: attempt %d err=%v timeout=%v",
 					mut.name, i, probeErr, probeTimeout)
-
-				// ── Phase 2: Fallback to skip-read ───────────────────
-				if err := request.SendNoRecv(target, attackReq, cfg); err != nil {
-					dbg(cfg, "[%s]: skip-read send error: %v", mut.name, err)
-					break
-				}
-				probeResp, _, probeTimeout, probeErr = request.RawRequest(target, probeReq, cfg)
-				if probeErr != nil || probeTimeout {
-					dbg(cfg, "[%s]: skip-read probe failed: err=%v timeout=%v", mut.name, i, probeErr, probeTimeout)
-					break
-				}
+				continue
 			}
 
 			probeStatus := request.StatusCode(probeResp)
@@ -316,13 +332,8 @@ func ScanCL0(target *url.URL, base []byte, cfg config.Config, rep *report.Report
 				// once more to filter transient WAF/CDN artifacts.
 				reproduced := false
 				for r := 0; r < 2; r++ {
-					reprResp, _, reprTimeout, reprErr := request.LastByteSyncProbe(
+					reprResp, _, reprTimeout, reprErr := request.PipelineCL0Probe(
 						target, attackReq, probeReq, cfg)
-					if reprErr != nil || reprTimeout {
-						// Fallback to skip-read
-						_ = request.SendNoRecv(target, attackReq, cfg)
-						reprResp, _, reprTimeout, reprErr = request.RawRequest(target, probeReq, cfg)
-					}
 					if reprErr == nil && !reprTimeout && request.StatusCode(reprResp) == probeStatus {
 						reproduced = true
 						break
@@ -447,7 +458,8 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 		return
 	}
 	baseStatus := baseline.Status
-	dbg(cfg, "H2CL0: baseline status=%d gadget=%q", baseStatus, gadget.payload)
+	baseBodyLen := len(baseline.Body)
+	dbg(cfg, "H2CL0: baseline status=%d bodyLen=%d gadget=%q", baseStatus, baseBodyLen, gadget.payload)
 	if isRateLimited(baseStatus) {
 		rep.Log("H2CL0: baseline returned %d (rate limited), skipping %s", baseStatus, host)
 		return
@@ -467,18 +479,37 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 		extra map[string]string
 	}{
 		{
-			// Primary Burp technique: X-Connection + CL=0.
-			// content-length: 0 tells the back-end the request has no body;
-			// the DATA frame bytes remain in the TCP buffer → CL.0.
-			"x-connection/cl-zero",
+			// Primary technique: real CL matching the actual body length.
+			// Valid HTTP/2 (CL matches DATA frame payload), so no PROTOCOL_ERROR.
+			// The HEAD method causes the back-end to ignore the body;
+			// body bytes stay in the TCP buffer → CL.0 desync.
+			// Matches Burp's working CL.0 HEAD payload (Req2).
+			"bare/cl-real",
 			map[string]string{
-				"x-connection":   "keep-alive",
-				"content-length": "0",
+				// no content-length override → h2BurstAttackAndProbe uses real body length
 			},
 		},
 		{
-			// Burp variant: X-Connection + no CL header.
-			// No content-length at all; the back-end infers body absence → CL.0.
+			// Real CL + X-Connection: keep-alive hint.
+			// Some front-ends forward X-Connection as Connection: keep-alive
+			// in H2→H1 downgrade, ensuring the back-end keeps the connection alive.
+			"x-connection/cl-real",
+			map[string]string{
+				"x-connection": "keep-alive",
+				// no content-length override → real body length
+			},
+		},
+		{
+			// Bare no-CL: omit content-length entirely, body in DATA frames.
+			// Valid HTTP/2 (CL is optional; body determined by DATA frames).
+			// Matches Burp's Req1 (HEAD with body, no CL).
+			"bare/no-cl",
+			map[string]string{
+				"content-length": "", // suppress
+			},
+		},
+		{
+			// X-Connection + no CL header.
 			"x-connection/no-cl",
 			map[string]string{
 				"x-connection":   "keep-alive",
@@ -486,18 +517,21 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 			},
 		},
 		{
-			// Bare CL=0 without X-Connection.
-			// Some front-ends strip X-Connection; this covers those that just see CL=0.
-			"bare/cl-zero",
+			// CL=0 with body: technically malformed HTTP/2 (CL doesn't match
+			// DATA frame length), but some non-conformant proxies accept it.
+			// The proxy forwards CL=0 to the back-end → back-end reads no body
+			// → DATA frame bytes stay in TCP buffer → CL.0.
+			"x-connection/cl-zero",
 			map[string]string{
+				"x-connection":   "keep-alive",
 				"content-length": "0",
 			},
 		},
 		{
-			// Bare no-CL: omit content-length entirely, no hop-by-hop tricks.
-			"bare/no-cl",
+			// Bare CL=0 without X-Connection.
+			"bare/cl-zero",
 			map[string]string{
-				"content-length": "", // suppress
+				"content-length": "0",
 			},
 		},
 	}
@@ -511,10 +545,10 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 				method, perm.name, gadget.payload, host)
 			dbg(cfg, "H2CL0 [%s/%s]: smuggled=%q", method, perm.name, smuggledBody)
 
-			if cfg.ExitOnFind && h2cl0runPerm(target, method, path, host, smuggledBody, perm.extra, perm.name, gadget, baseStatus, cfg, rep) {
+			if cfg.ExitOnFind && h2cl0runPerm(target, method, path, host, smuggledBody, perm.extra, perm.name, gadget, baseStatus, baseBodyLen, cfg, rep) {
 				return
 			} else if !cfg.ExitOnFind {
-				h2cl0runPerm(target, method, path, host, smuggledBody, perm.extra, perm.name, gadget, baseStatus, cfg, rep)
+				h2cl0runPerm(target, method, path, host, smuggledBody, perm.extra, perm.name, gadget, baseStatus, baseBodyLen, cfg, rep)
 			}
 		}
 
@@ -590,13 +624,42 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 				method, inj.name, gadget.payload, host)
 			dbg(cfg, "H2CL0 [%s/%s]: smuggled=%q bodyLen=%d", method, inj.name, smuggledBody, bodyLen)
 
-			if cfg.ExitOnFind && h2cl0runPerm(target, method, path, host, smuggledBody, inj.extra, inj.name, gadget, baseStatus, cfg, rep) {
+			if cfg.ExitOnFind && h2cl0runPerm(target, method, path, host, smuggledBody, inj.extra, inj.name, gadget, baseStatus, baseBodyLen, cfg, rep) {
 				return
 			} else if !cfg.ExitOnFind {
-				h2cl0runPerm(target, method, path, host, smuggledBody, inj.extra, inj.name, gadget, baseStatus, cfg, rep)
+				h2cl0runPerm(target, method, path, host, smuggledBody, inj.extra, inj.name, gadget, baseStatus, baseBodyLen, cfg, rep)
 			}
 		}
 	}
+}
+
+// formatH2AttackRaw builds a human-readable HTTP/2 request representation for findings.
+// It formats the extra headers map as proper header lines and correctly shows or
+// suppresses content-length based on the extra map (matching actual wire behavior).
+func formatH2AttackRaw(method, path, host string, extra map[string]string, body string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%s %s HTTP/2\r\n", method, path))
+	b.WriteString(fmt.Sprintf(":authority: %s\r\n", host))
+
+	clValue := fmt.Sprintf("%d", len(body))
+	suppressCL := false
+	for k, v := range extra {
+		switch {
+		case k == "content-length" && v == "":
+			suppressCL = true
+		case k == "content-length":
+			clValue = v
+		default:
+			if v != "" {
+				b.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+			}
+		}
+	}
+	if !suppressCL {
+		b.WriteString(fmt.Sprintf("content-length: %s\r\n", clValue))
+	}
+	b.WriteString(fmt.Sprintf("\r\n%s", body))
+	return b.String()
 }
 
 // h2cl0runPerm executes a single H2 CL.0 permutation across cfg.Attempts attempts.
@@ -609,7 +672,7 @@ func ScanH2CL0(target *url.URL, base []byte, cfg config.Config, rep *report.Repo
 func h2cl0runPerm(
 	target *url.URL, method, path, host, smuggledBody string,
 	extra map[string]string, permName string,
-	gadget *cl0Gadget, baseStatus int,
+	gadget *cl0Gadget, baseStatus int, baseBodyLen int,
 	cfg config.Config, rep *report.Reporter,
 ) bool {
 	const burstSize = 5 // send 5 attacks before each probe
@@ -665,10 +728,8 @@ func h2cl0runPerm(
 					permName, gadget.lookFor, gadget.payload, method, attempt),
 				Evidence: fmt.Sprintf("attempt=%d gadget=%q marker=%q probe_status=%d baseline=%d",
 					attempt, gadget.payload, gadget.lookFor, probeStatus, baseStatus),
-				RawProbe: fmt.Sprintf(
-					"[stream 1] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
-						"[stream 3] GET %s HTTP/2\r\nHost: %s\r\n",
-					method, path, host, extra, len(smuggledBody), smuggledBody, path, host),
+				RawProbe: fmt.Sprintf("[stream 1] %s\n[stream 3] GET %s HTTP/2\r\n:authority: %s\r\n",
+					formatH2AttackRaw(method, path, host, extra, smuggledBody), path, host),
 			})
 			return true
 		}
@@ -719,13 +780,71 @@ func h2cl0runPerm(
 					probeStatus, baseStatus, attempt, burstSize, permName, method),
 				Evidence: fmt.Sprintf("attempt=%d burst=%d probe_status=%d baseline=%d reproduced=true",
 					attempt, burstSize, probeStatus, baseStatus),
-				RawProbe: fmt.Sprintf(
-					"[streams 1-%d] %s %s HTTP/2\r\nHost: %s\r\n%v\r\ncontent-length: %d\r\n\r\n%s\n"+
-						"[stream %d] GET %s HTTP/2\r\nHost: %s\r\n",
-					burstSize*2-1, method, path, host, extra, len(smuggledBody), smuggledBody,
+				RawProbe: fmt.Sprintf("[streams 1-%d] %s\n[stream %d] GET %s HTTP/2\r\n:authority: %s\r\n",
+					burstSize*2-1, formatH2AttackRaw(method, path, host, extra, smuggledBody),
 					burstSize*2+1, path, host),
 			})
 			return true
+		}
+
+		// ── Detection 3: body-size divergence (PROBABLE) ─────────────────
+		// When the gadget was selected by body-size divergence (same status class
+		// but very different response size), check if the probe body size matches
+		// the gadget's expected size rather than the baseline.
+		if gadget.responseLen > 0 && attempt > 0 && probeStatus == baseStatus {
+			probeBodyLen := len(probe.Body)
+			// Check if probe body size is closer to the gadget's size than to baseline.
+			// Require at least 100 bytes delta from baseline.
+			bDelta := probeBodyLen - baseBodyLen
+			if bDelta < 0 {
+				bDelta = -bDelta
+			}
+			gDelta := probeBodyLen - gadget.responseLen
+			if gDelta < 0 {
+				gDelta = -gDelta
+			}
+			// Probe is closer to gadget size AND significantly different from baseline
+			if bDelta > 100 && gDelta < bDelta/2 {
+				dbg(cfg, "H2CL0 [%s/%s]: body-size divergence at attempt %d: probeLen=%d gadgetLen=%d",
+					method, permName, attempt, probeBodyLen, gadget.responseLen)
+
+				// Reproduce
+				reproduced := false
+				for r := 0; r < 2; r++ {
+					reprProbe, reprErr := h2BurstAttackAndProbe(target, method, path, host, smuggledBody, extra, burstSize, cfg)
+					if reprErr == nil && reprProbe.Status != 0 {
+						reprLen := len(reprProbe.Body)
+						reprDelta := reprLen - gadget.responseLen
+						if reprDelta < 0 {
+							reprDelta = -reprDelta
+						}
+						if reprDelta < bDelta/2 {
+							reproduced = true
+							break
+						}
+					}
+				}
+				if reproduced {
+					rep.Emit(report.Finding{
+						Target:    target.String(),
+						Method:    "HTTP/2",
+						Severity:  report.SeverityProbable,
+						Type:      "H2.CL0",
+						Technique: fmt.Sprintf("H2.CL0/%s/%s", method, permName),
+						Description: fmt.Sprintf(
+							"H2 CL.0 desync (body-size): probe body size %d bytes matches gadget "+
+								"expected %d bytes (baseline would be different) after %d attempts "+
+								"(%d attacks per burst, technique=%s, method=%s).",
+							probeBodyLen, gadget.responseLen, attempt, burstSize, permName, method),
+						Evidence: fmt.Sprintf("attempt=%d burst=%d probe_body_len=%d gadget_body_len=%d reproduced=true",
+							attempt, burstSize, probeBodyLen, gadget.responseLen),
+						RawProbe: fmt.Sprintf("[streams 1-%d] %s\n[stream %d] GET %s HTTP/2\r\n:authority: %s\r\n",
+							burstSize*2-1, formatH2AttackRaw(method, path, host, extra, smuggledBody),
+							burstSize*2+1, path, host),
+					})
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -733,6 +852,14 @@ func h2cl0runPerm(
 
 // selectCL0Gadget fires each gadget request directly to find one whose
 // response is distinctive and not already present in baseline responses.
+//
+// Selection strategy (in priority order):
+//   1. Marker match: the gadget's marker string appears in its response but NOT
+//      in the baseline response. Enables both Detection 1 (gadget bleed) and
+//      Detection 2 (status divergence).
+//   2. Status divergence: the gadget's response status is in a different HTTP
+//      class (e.g. 2xx vs 4xx) from the baseline. Enables Detection 2 only.
+//      This covers cases like canary returning 200 when baseline is 404.
 //
 // The canary path (cfg.CanaryPath) is prepended as a high-priority dynamic
 // gadget: many servers echo the requested path in 404 error pages, making
@@ -761,6 +888,13 @@ func selectCL0Gadget(target *url.URL, baseReq []byte, cfg config.Config, rep *re
 	candidates := append([]cl0Gadget{canaryGadget}, clGadgets...)
 
 	baseResp, _, _, _ := request.RawRequest(target, baseReq, cfg)
+	baseStatus := request.StatusCode(baseResp)
+	baseBodyLen := request.BodyLength(baseResp)
+
+	// Track best status-divergence-only candidate (fallback when no marker matches).
+	var statusCandidate *cl0Gadget
+	// Track best body-size-divergence candidate (third fallback).
+	var sizeCandidate *cl0Gadget
 
 	for i := range candidates {
 		g := &candidates[i]
@@ -776,15 +910,67 @@ func selectCL0Gadget(target *url.URL, baseReq []byte, cfg config.Config, rep *re
 		if err != nil || timedOut || len(resp) == 0 {
 			continue
 		}
+
+		gadgetStatus := request.StatusCode(resp)
+		gadgetBodyLen := request.BodyLength(resp)
+
+		// Track status-divergence candidate: gadget returns a different HTTP
+		// class from baseline (e.g. 200 vs 404). Even without marker matching,
+		// Detection 2 can use the status to confirm smuggling.
+		if statusCandidate == nil && gadgetStatus > 0 && baseStatus > 0 &&
+			gadgetStatus/100 != baseStatus/100 {
+			g.responseStatus = gadgetStatus
+			g.responseLen = gadgetBodyLen
+			statusCandidate = g
+		}
+
+		// Track body-size-divergence candidate: gadget has a significantly
+		// different body size from baseline (>50% difference, minimum 100 bytes
+		// delta). Useful when both return the same status class but different content.
+		if sizeCandidate == nil && gadgetBodyLen > 0 && baseBodyLen > 0 &&
+			gadgetStatus > 0 && gadgetStatus == baseStatus {
+			delta := gadgetBodyLen - baseBodyLen
+			if delta < 0 {
+				delta = -delta
+			}
+			maxLen := gadgetBodyLen
+			if baseBodyLen > maxLen {
+				maxLen = baseBodyLen
+			}
+			if delta > 100 && delta*100/maxLen > 50 {
+				g.responseStatus = gadgetStatus
+				g.responseLen = gadgetBodyLen
+				sizeCandidate = g
+			}
+		}
+
 		if baseResp != nil && request.ContainsStr(baseResp, g.lookFor) {
 			continue
 		}
 		if !gadgetMatches(resp, g) {
 			continue
 		}
-		g.responseStatus = request.StatusCode(resp)
+		g.responseStatus = gadgetStatus
+		g.responseLen = gadgetBodyLen
 		rep.Log("CL.0: selected gadget '%s' (marker=%q status=%d) for %s", g.payload, g.lookFor, g.responseStatus, host)
 		return g
+	}
+
+	// No marker-matched gadget found. Fall back to status-divergence candidate:
+	// the gadget won't enable Detection 1 (marker bleed) but WILL enable
+	// Detection 2 (status divergence) since responseStatus is set.
+	if statusCandidate != nil {
+		rep.Log("CL.0: selected gadget '%s' by status divergence (gadget=%d baseline=%d) for %s",
+			statusCandidate.payload, statusCandidate.responseStatus, baseStatus, host)
+		return statusCandidate
+	}
+
+	// Third fallback: body-size divergence. Same status class but very different
+	// response size — indicates a different resource was served.
+	if sizeCandidate != nil {
+		rep.Log("CL.0: selected gadget '%s' by body-size divergence (gadget=%d bytes baseline=%d bytes) for %s",
+			sizeCandidate.payload, sizeCandidate.responseLen, baseBodyLen, host)
+		return sizeCandidate
 	}
 	return nil
 }
